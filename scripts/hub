@@ -588,11 +588,14 @@ def cmd_adopt(args, rep):
     if args.from_census:
         with open(args.from_census) as fh:
             census = json.load(fh)
+        skip = {s for s in (args.skip or "").split(",") if s}
         seen_real = set()
         for row in census["rows"]:
             label = row.get("label")
             if label not in ("entity", "entity-versioned", "nested-git",
                             "external-link", "cross-link"):
+                continue
+            if row.get("suggested_name") in skip:
                 continue
             if row.get("dedup") in ("duplicate",):
                 continue
@@ -655,6 +658,8 @@ def materialize(manifest, dev, rep, dry=False):
     skills_meta = manifest.get("skills", {})
     default_agents = manifest.get("hub", {}).get("default_agents", [])
     agents_cfg = manifest.get("agents", {})
+    externals_all = {e["name"]: os.path.expanduser(e["path"])
+                     for e in dev.get("external", [])}
     foreign = []
     for agent in dev.get("agents", []):
         cfg = agents_cfg.get(agent)
@@ -675,6 +680,9 @@ def materialize(manifest, dev, rep, dry=False):
                 rep.act(f"mkdir {target}")
         want = [s for s in enabled
                 if agent in skills_meta.get(s, {}).get("agents", default_agents)]
+        ext_want = {e["name"]: os.path.expanduser(e["path"])
+                    for e in dev.get("external", [])
+                    if agent in e.get("agents", dev.get("agents", []))}
         state_fp = os.path.join(target, ".hub-state.json")
         state = {"managed": []}
         if mode == "copy" and os.path.exists(state_fp):
@@ -710,6 +718,27 @@ def materialize(manifest, dev, rep, dry=False):
                     rep.act(f"copy {agent}:{s}")
                 if s not in state["managed"]:
                     state["managed"].append(s)
+        # 1b) external references (path lives outside the hub; content not vendored)
+        for ename, epath in ext_want.items():
+            dst = os.path.join(target, ename)
+            if not os.path.isdir(epath):
+                rep.warn(f"external '{ename}' path missing on this machine "
+                         f"({epath}) — skipped")
+                continue
+            if os.path.islink(dst) and os.readlink(dst) == epath:
+                continue
+            if dry:
+                rep.act(f"[dry] link external {dst} -> {epath}")
+                continue
+            if os.path.isdir(dst) and not os.path.islink(dst):
+                foreign.append((agent, dst, "entity blocks external link"))
+                continue
+            tmp = dst + ".hub-tmp"
+            if os.path.lexists(tmp):
+                os.remove(tmp)
+            os.symlink(epath, tmp)
+            os.replace(tmp, dst)
+            rep.act(f"link external {agent}:{ename}")
         # 2) cleanup
         if os.path.isdir(target):
             for entry in sorted(os.listdir(target)):
@@ -723,6 +752,9 @@ def materialize(manifest, dev, rep, dry=False):
                         _rm(fp, dry, rep, f"cache-link {agent}:{entry} (铁律2)")
                     elif not os.path.exists(fp):
                         _rm(fp, dry, rep, f"broken link {agent}:{entry}")
+                    elif entry in externals_all:
+                        if entry not in ext_want:
+                            _rm(fp, dry, rep, f"stale external link {agent}:{entry}")
                     elif real.startswith(hub_skills_real + os.sep) and \
                             entry not in want:
                         _rm(fp, dry, rep, f"stale hub link {agent}:{entry}")
@@ -1369,6 +1401,17 @@ def cmd_selftest(args, rep):
             txt = open(dev_fp).read().replace('disable  = ["demo"]', 'disable  = []')
             open(dev_fp, "w").write(txt)
             _dispatch(_parse(["sync"]), Report("sync4"))
+            # external reference: path outside the hub, per-agent scoped
+            extdir = os.path.join(td, "ext-skill")
+            os.makedirs(extdir)
+            open(os.path.join(extdir, "SKILL.md"), "w").write("ext\n")
+            with open(dev_fp, "a") as fh:
+                fh.write(f'\n[[external]]\nname   = "extref"\n'
+                         f'path   = "{extdir}"\nagents = ["claude"]\n')
+            _dispatch(_parse(["sync"]), Report("sync-ext"))
+            check(os.path.islink(os.path.join(claude_t, "extref")) and
+                  not os.path.lexists(os.path.join(agents_t, "extref")),
+                  "external link only on declared agent")
             # upstream evolves + local patch -> clean 3-way merge
             open(p("skills", "demo", "SKILL.md"), "a").write("local-patch\n")
             up_fp = os.path.join(upstream, "skills", "demo", "SKILL.md")
@@ -1460,6 +1503,7 @@ def _parse(argv):
     a.add_argument("--name")
     a.add_argument("--origin", choices=["self", "vendor"])
     a.add_argument("--source")
+    a.add_argument("--skip", help="census mode: comma-separated names to skip")
     s = sub.add_parser("sync")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--no-push", action="store_true")
