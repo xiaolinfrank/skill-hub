@@ -531,7 +531,11 @@ def cmd_census(args, rep):
                     row["dedup"] = "CONFLICT"
                     row["tree_hash"] = hashes[real]
             else:
-                for i, (real, row) in enumerate(sorted(by_real.items())):
+                # identical content: prefer the copy that carries provenance
+                ordered = sorted(by_real.items(),
+                                 key=lambda kv: (0 if kv[1].get("git_remote")
+                                                 else 1, kv[0]))
+                for i, (real, row) in enumerate(ordered):
                     row["dedup"] = "primary" if i == 0 else "duplicate"
         else:
             next(iter(by_real.values()))["dedup"] = "unique"
@@ -1486,7 +1490,10 @@ def cmd_selftest(args, rep):
 def _parse(argv):
     ap = argparse.ArgumentParser(prog="hub", description=__doc__)
     ap.add_argument("--json", action="store_true")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True, parser_class=(
+        lambda **kw: argparse.ArgumentParser(parents=[common], **kw)))
 
     sub.add_parser("init")
     o = sub.add_parser("onboard")
