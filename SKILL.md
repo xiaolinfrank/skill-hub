@@ -43,9 +43,11 @@ description: >
 
 ## 2. Output contract
 
-Every command supports `--json`: `{ok, cmd, actions, warnings, needs_attention,
-data}`. Exit codes: 0 done · 1 agent attention needed · 2 environment/config
-error (report to user, do NOT retry blindly).
+Every command supports `--json` (placed after the subcommand): `{ok, cmd,
+actions, warnings, needs_attention, data}`. Exit codes: 0 done · 1 agent
+attention needed · 2 environment/config error (report to user, do NOT retry
+blindly). Exception: `hub lock-merge` is a git merge driver — no JSON, exit
+0/1 per git's contract.
 
 ## 3. Conflict playbook (update / sync rebase)
 
@@ -53,7 +55,10 @@ error (report to user, do NOT retry blindly).
 2. Understand all three sides (base = `upstream/<name>`, ours = `skills/<name>`,
    theirs = incoming) and write a semantic merge: preserve the intent of local
    patches, absorb upstream improvements.
-3. `hub update <name> --continue` (or `git rebase --continue` for sync).
+3. For update conflicts: resolve markers (and any `*.upstream` sidecars for
+   binary files), then `hub update <name> --continue`. For sync rebase
+   conflicts the rebase was already aborted safely — re-run
+   `git pull --rebase`, resolve semantically, then `hub sync`.
 4. `hub sync` to finish; commit message must state the merge decision.
 
 ## 4. Escalate to the human first (ask before acting)
@@ -67,8 +72,9 @@ error (report to user, do NOT retry blindly).
 ## 5. Self-modification discipline
 
 After changing `scripts/hub` or `scripts/guard`: `hub selftest` must pass
-before committing; run any destructive subcommand of the new version with
-`--dry-run` first.
+before committing; run `hub sync --dry-run` of the new version before a real
+sync. (`update` has no dry-run yet — preview with `hub update --check` and
+`hub diff`, and rely on git history to revert.)
 
 ## 6. Periodic routine (when guard prompts, or on request)
 
