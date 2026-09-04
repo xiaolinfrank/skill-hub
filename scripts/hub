@@ -1,0 +1,1518 @@
+#!/usr/bin/env python3
+"""hub — manage a personal skills library across agents, devices, and upstreams.
+
+Canonical layout (the "instance", default ~/skills-hub, override $SKILL_HUB_ROOT):
+    hub.toml            manifest: agents (materialize targets), profiles, skill sources
+    devices/<id>.toml   per-device selection (profiles/agents/extra/disable)
+    hub.lock.json       provenance lockfile (machine-maintained)
+    skills/<name>/      the only entity layer
+    upstream/<name>/    pristine upstream snapshots (vendor-origin skills only)
+    NEEDS_ATTENTION.md  async inbox for the maintaining agent (absent when clean)
+
+Exit codes: 0 done · 1 needs agent attention · 2 environment/config error.
+All commands accept --json for structured output: {ok, cmd, actions, warnings,
+needs_attention, data}.
+"""
+
+import argparse
+import datetime
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+if sys.version_info < (3, 11):
+    sys.stderr.write("hub: requires Python 3.11+ (tomllib)\n")
+    sys.exit(2)
+import tomllib  # noqa: E402
+
+# ---------------------------------------------------------------- paths / consts
+
+HUB_ROOT = os.path.expanduser(os.environ.get("SKILL_HUB_ROOT", "~/skills-hub"))
+DEVICE_FILE = os.path.expanduser(
+    os.environ.get("SKILL_HUB_DEVICE_FILE", "~/.agents/device-id"))
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+VERSION_SUFFIX_RE = re.compile(r"^(?P<base>.+?)[-_]v?(?P<ver>\d+(\.\d+){1,3})$")
+CACHE_MARKER = "/plugins/cache/"
+PROTECT_ALWAYS = {"synced", ".system"}
+SCHEMA = 1
+
+
+def now_iso():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def p(*parts):
+    return os.path.join(HUB_ROOT, *parts)
+
+
+# ---------------------------------------------------------------- report object
+
+
+class Report:
+    def __init__(self, cmd):
+        self.cmd = cmd
+        self.ok = True
+        self.actions = []
+        self.warnings = []
+        self.needs_attention = []
+        self.data = {}
+        self.exit_code = 0
+
+    def act(self, msg):
+        self.actions.append(msg)
+
+    def warn(self, msg):
+        self.warnings.append(msg)
+
+    def attention(self, msg):
+        self.needs_attention.append(msg)
+        if self.exit_code == 0:
+            self.exit_code = 1
+        self.ok = False
+
+    def fail(self, msg, code=2):
+        self.warnings.append(msg)
+        self.ok = False
+        self.exit_code = code
+
+    def emit(self, as_json):
+        if as_json:
+            print(json.dumps({
+                "ok": self.ok, "cmd": self.cmd, "actions": self.actions,
+                "warnings": self.warnings, "needs_attention": self.needs_attention,
+                "data": self.data}, ensure_ascii=False, indent=2))
+        else:
+            for a in self.actions:
+                print(f"  · {a}")
+            for w in self.warnings:
+                print(f"  ! {w}", file=sys.stderr)
+            for n in self.needs_attention:
+                print(f"  ⚠ {n}", file=sys.stderr)
+        return self.exit_code
+
+
+# ---------------------------------------------------------------- small helpers
+
+
+def run(cmd, cwd=None, check=True, capture=True):
+    return subprocess.run(
+        cmd, cwd=cwd, check=check,
+        capture_output=capture, text=True)
+
+
+def git(args, cwd=None, check=True):
+    return run(["git"] + args, cwd=cwd or HUB_ROOT, check=check)
+
+
+def has_remote(cwd=None):
+    return run(["git", "remote", "get-url", "origin"],
+               cwd=cwd or HUB_ROOT, check=False).returncode == 0
+
+
+def tree_hash(path):
+    """Stable content hash of a directory tree (symlinks hashed as targets)."""
+    h = hashlib.sha256()
+    entries = []
+    for root, dirs, files in os.walk(path):
+        dirs[:] = sorted(d for d in dirs if d != ".git")
+        for f in sorted(files):
+            if f == ".DS_Store":
+                continue
+            fp = os.path.join(root, f)
+            entries.append((os.path.relpath(fp, path), fp))
+    for rel, fp in sorted(entries):
+        h.update(rel.encode())
+        if os.path.islink(fp):
+            h.update(b"L" + os.readlink(fp).encode())
+        else:
+            try:
+                with open(fp, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(65536), b""):
+                        h.update(chunk)
+            except OSError:
+                h.update(b"?")
+    return "sha256:" + h.hexdigest()
+
+
+def copy_tree(src, dst):
+    """rsync -a --exclude .git equivalent; dst is replaced."""
+    if os.path.exists(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst, symlinks=True,
+                    ignore=shutil.ignore_patterns(".git", ".DS_Store"))
+
+
+def normalize_name(name):
+    n = name.strip().lower()
+    m = VERSION_SUFFIX_RE.match(n)   # strip version suffix BEFORE dot rewriting
+    if m:
+        n = m.group("base")
+    n = n.replace("_", "-").replace(" ", "-").replace(".", "-")
+    n = re.sub(r"-{2,}", "-", n).strip("-")
+    return n
+
+
+def load_manifest():
+    fp = p("hub.toml")
+    if not os.path.exists(fp):
+        raise FileNotFoundError(f"{fp} not found — run `hub init` first")
+    with open(fp, "rb") as fh:
+        return tomllib.load(fh)
+
+
+def load_lock():
+    fp = p("hub.lock.json")
+    if not os.path.exists(fp):
+        return {"schema": SCHEMA, "skills": {}}
+    with open(fp) as fh:
+        return json.load(fh)
+
+
+def save_lock(lock):
+    with open(p("hub.lock.json"), "w") as fh:
+        json.dump(lock, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def device_id(rep):
+    if not os.path.exists(DEVICE_FILE):
+        rep.fail(f"device id file {DEVICE_FILE} missing — run `hub onboard`", 2)
+        return None
+    did = open(DEVICE_FILE).read().strip()
+    if not did:
+        rep.fail(f"device id file {DEVICE_FILE} is empty — run `hub onboard`", 2)
+        return None
+    if not os.path.exists(p("devices", f"{did}.toml")):
+        rep.fail(f"devices/{did}.toml not found in hub — run `hub onboard` "
+                 f"(no silent default; refusing to guess)", 2)
+        return None
+    return did
+
+
+def load_device(did):
+    with open(p("devices", f"{did}.toml"), "rb") as fh:
+        return tomllib.load(fh)
+
+
+def skill_names():
+    d = p("skills")
+    if not os.path.isdir(d):
+        return []
+    return sorted(e for e in os.listdir(d)
+                  if os.path.isdir(os.path.join(d, e)) and not e.startswith("."))
+
+
+def expand_enabled(manifest, dev, rep=None):
+    names = skill_names()
+    enabled = set()
+    profiles = manifest.get("profiles", {})
+    for prof in dev.get("profiles", []):
+        pats = profiles.get(prof)
+        if pats is None:
+            if rep:
+                rep.warn(f"device references unknown profile '{prof}'")
+            continue
+        for pat in pats:
+            hits = fnmatch.filter(names, pat)
+            if not hits and rep:
+                rep.warn(f"profile '{prof}' pattern '{pat}' matches no skill")
+            enabled.update(hits)
+    for extra in dev.get("extra", []):
+        hits = fnmatch.filter(names, extra)
+        if hits:
+            enabled.update(hits)
+        elif rep:
+            rep.warn(f"extra '{extra}' matches no skill")
+    for dis in dev.get("disable", []):
+        enabled -= set(fnmatch.filter(names, dis))
+    return sorted(enabled)
+
+
+def needs_attention_write(title, lines):
+    fp = p("NEEDS_ATTENTION.md")
+    header = not os.path.exists(fp)
+    with open(fp, "a") as fh:
+        if header:
+            fh.write("# NEEDS ATTENTION\n\n"
+                     "Pending items for the maintaining agent. Delete this file "
+                     "once every item is handled.\n")
+        fh.write(f"\n## {title} — {now_iso()}\n\n")
+        for ln in lines:
+            fh.write(f"- {ln}\n")
+
+
+def append_manifest_skill(name, origin, source, pin=False):
+    """Append-only [skills.<name>] block (no TOML serializer round-trip)."""
+    with open(p("hub.toml"), "a") as fh:
+        fh.write(f"\n[skills.{name}]\n")
+        fh.write(f'origin = "{origin}"\n')
+        if source:
+            fh.write(f'source = "{source}"\n')
+        if pin:
+            fh.write("pin    = true\n")
+
+
+def parse_source(spec):
+    """git+<url>#ref=<r>&subdir=<s>  |  local path.  Returns dict or None."""
+    if spec.startswith("git+"):
+        rest = spec[4:]
+        url, _, frag = rest.partition("#")
+        opts = dict(kv.split("=", 1) for kv in frag.split("&") if "=" in kv)
+        return {"type": "git", "url": url,
+                "ref": opts.get("ref", "main"),
+                "subdir": opts.get("subdir", "")}
+    if os.path.isdir(os.path.expanduser(spec)):
+        return {"type": "local", "path": os.path.abspath(os.path.expanduser(spec))}
+    return None
+
+
+def source_to_spec(src):
+    if src.get("type") == "git":
+        s = f"git+{src['url']}#ref={src.get('ref', 'main')}"
+        if src.get("subdir"):
+            s += f"&subdir={src['subdir']}"
+        return s
+    if src.get("type") == "local":
+        return src.get("path", "")
+    return json.dumps(src)
+
+
+def fetch_upstream(src, tmp):
+    """Fetch upstream skill content into tmp/<content>. Returns (dir, commit)."""
+    if src["type"] == "git":
+        clone = os.path.join(tmp, "clone")
+        run(["git", "clone", "--quiet", "--depth", "1",
+             "--branch", src.get("ref", "main"), src["url"], clone])
+        commit = run(["git", "rev-parse", "HEAD"], cwd=clone).stdout.strip()
+        content = os.path.join(clone, src.get("subdir", "")) if src.get("subdir") else clone
+        if not os.path.isdir(content):
+            raise FileNotFoundError(f"subdir '{src.get('subdir')}' not in {src['url']}")
+        return content, commit
+    if src["type"] == "local":
+        if not os.path.isdir(src["path"]):
+            raise FileNotFoundError(src["path"])
+        commit = None
+        r = run(["git", "-C", src["path"], "rev-parse", "HEAD"], check=False)
+        if r.returncode == 0:
+            commit = r.stdout.strip()
+        return src["path"], commit
+    raise ValueError(f"unsupported source type {src['type']}")
+
+
+# ---------------------------------------------------------------- init / onboard
+
+
+def cmd_init(args, rep):
+    os.makedirs(HUB_ROOT, exist_ok=True)
+    for d in ("skills", "upstream", "devices"):
+        os.makedirs(p(d), exist_ok=True)
+    if not os.path.exists(p("hub.toml")):
+        with open(p("hub.toml"), "w") as fh:
+            fh.write(f'''[hub]
+schema = {SCHEMA}
+default_agents = ["claude", "agents-std"]
+
+[agents.claude]
+target  = "~/.claude/skills"
+mode    = "symlink"
+protect = ["synced"]
+
+[agents.agents-std]
+target = "~/.agents/skills"
+mode   = "symlink"
+
+[profiles]
+base = ["skill-hub"]
+''')
+        rep.act("wrote hub.toml")
+    if not os.path.exists(p("hub.lock.json")):
+        save_lock({"schema": SCHEMA, "skills": {}})
+        rep.act("wrote hub.lock.json")
+    if not os.path.exists(p(".gitattributes")):
+        with open(p(".gitattributes"), "w") as fh:
+            fh.write("hub.lock.json merge=hub-lock\n")
+        rep.act("wrote .gitattributes")
+    if not os.path.exists(p(".gitignore")):
+        with open(p(".gitignore"), "w") as fh:
+            fh.write(".DS_Store\n.logs/\n.hub-pending/\n*.tmp\n")
+        rep.act("wrote .gitignore")
+    if not os.path.isdir(p(".git")):
+        git(["init", "--quiet"])
+        rep.act("git init")
+    rep.data["root"] = HUB_ROOT
+
+
+def cmd_onboard(args, rep):
+    did = args.device
+    if not did:
+        if sys.stdin.isatty():
+            did = input("device name (e.g. fosun-macbook-air): ").strip()
+        if not did:
+            rep.fail("no device name (pass --device NAME)", 2)
+            return
+    did = normalize_name(did)
+    os.makedirs(os.path.dirname(DEVICE_FILE), exist_ok=True)
+    with open(DEVICE_FILE, "w") as fh:
+        fh.write(did + "\n")
+    rep.act(f"device id '{did}' -> {DEVICE_FILE}")
+    dev_fp = p("devices", f"{did}.toml")
+    if not os.path.exists(dev_fp):
+        os.makedirs(p("devices"), exist_ok=True)
+        with open(dev_fp, "w") as fh:
+            fh.write(f'# devices/{did}.toml — edit profiles/agents for this device\n'
+                     f'profiles = ["base"]\n'
+                     f'agents   = ["claude", "agents-std"]\n'
+                     f'extra    = []\n'
+                     f'disable  = []\n')
+        rep.act(f"created devices/{did}.toml (edit to taste)")
+    # merge driver must be registered per-clone (doctor check #13)
+    hub_bin = os.path.abspath(__file__)
+    git(["config", "merge.hub-lock.driver", f"{hub_bin} lock-merge %O %A %B"])
+    rep.act("registered hub-lock merge driver in .git/config")
+    if not args.no_bin:
+        bindir = os.path.expanduser("~/.local/bin")
+        os.makedirs(bindir, exist_ok=True)
+        link = os.path.join(bindir, "hub")
+        tmp = link + ".tmp"
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        os.symlink(hub_bin, tmp)
+        os.replace(tmp, link)
+        rep.act(f"linked {link} -> {hub_bin}")
+    if args.with_hook:
+        _install_hook(rep)
+    if args.with_launchd:
+        _install_launchd(rep)
+    rep.data["device"] = did
+
+
+def _install_hook(rep):
+    settings_fp = os.path.expanduser("~/.claude/settings.json")
+    guard = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guard")
+    settings = {}
+    if os.path.exists(settings_fp):
+        try:
+            settings = json.load(open(settings_fp))
+        except json.JSONDecodeError:
+            rep.warn(f"{settings_fp} is not valid JSON — hook NOT installed")
+            return
+    hooks = settings.setdefault("hooks", {})
+    entries = hooks.setdefault("SessionStart", [])
+    if any("skill-hub" in json.dumps(e) or guard in json.dumps(e) for e in entries):
+        rep.act("SessionStart guard already present")
+        return
+    entries.append({"hooks": [{"type": "command", "command": guard}]})
+    with open(settings_fp, "w") as fh:
+        json.dump(settings, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    rep.act(f"installed SessionStart guard hook in {settings_fp}")
+
+
+def _install_launchd(rep):
+    hub_bin = os.path.abspath(__file__)
+    logs = p(".logs")
+    os.makedirs(logs, exist_ok=True)
+    jobs = {
+        "com.skillhub.sync": (["sync"], {"Hour": 9, "Minute": 30}),
+        "com.skillhub.weekly": (
+            ["doctor", "--write-attention"], {"Weekday": 1, "Hour": 10, "Minute": 0}),
+    }
+    la = os.path.expanduser("~/Library/LaunchAgents")
+    os.makedirs(la, exist_ok=True)
+    for label, (sub, cal) in jobs.items():
+        cal_xml = "".join(
+            f"<key>{k}</key><integer>{v}</integer>" for k, v in cal.items())
+        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key><array>
+    <string>{hub_bin}</string>{''.join(f'<string>{a}</string>' for a in sub)}
+  </array>
+  <key>StartCalendarInterval</key><dict>{cal_xml}</dict>
+  <key>StandardOutPath</key><string>{logs}/{label}.log</string>
+  <key>StandardErrorPath</key><string>{logs}/{label}.log</string>
+</dict></plist>
+"""
+        fp = os.path.join(la, f"{label}.plist")
+        with open(fp, "w") as fh:
+            fh.write(plist)
+        run(["launchctl", "unload", fp], check=False)
+        run(["launchctl", "load", fp], check=False)
+        rep.act(f"launchd job {label} installed")
+
+
+# ---------------------------------------------------------------- census
+
+
+def _git_top_and_remote(path):
+    r = run(["git", "-C", path, "rev-parse", "--show-toplevel"], check=False)
+    if r.returncode != 0:
+        return None, None
+    top = r.stdout.strip()
+    rr = run(["git", "-C", top, "remote", "get-url", "origin"], check=False)
+    return top, (rr.stdout.strip() if rr.returncode == 0 else None)
+
+
+def cmd_census(args, rep):
+    dirs = [os.path.expanduser(d) for d in (args.dirs or [
+        "~/.claude/skills", "~/.agents/skills", "~/.codex/skills"])]
+    scanned_real = [os.path.realpath(d) for d in dirs if os.path.isdir(d)]
+    rows = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            rep.warn(f"skip missing dir {d}")
+            continue
+        for name in sorted(os.listdir(d)):
+            fp = os.path.join(d, name)
+            row = {"dir": d, "name": name, "path": fp}
+            if name in PROTECT_ALWAYS or name.startswith("."):
+                row["label"] = "internal"
+            elif os.path.islink(fp):
+                target = os.readlink(fp)
+                real = os.path.realpath(fp)
+                row["link_target"] = target
+                row["realpath"] = real
+                if CACHE_MARKER in target or CACHE_MARKER in real:
+                    row["label"] = "cache-link"
+                elif not os.path.exists(fp):
+                    row["label"] = "broken"
+                elif any(real == os.path.join(sr, os.path.basename(real)) and
+                         os.path.dirname(real) == sr for sr in scanned_real):
+                    row["label"] = "cross-link"
+                elif real.startswith(os.path.realpath(p("skills")) + os.sep):
+                    row["label"] = "hub-managed"
+                else:
+                    row["label"] = "external-link"
+                    top, remote = _git_top_and_remote(real)
+                    if top:
+                        row["git_top"] = top
+                        row["git_remote"] = remote
+                        row["subdir"] = os.path.relpath(real, top)
+            elif os.path.isdir(fp):
+                if os.path.isdir(os.path.join(fp, ".git")):
+                    row["label"] = "nested-git"
+                    top, remote = _git_top_and_remote(fp)
+                    row["git_remote"] = remote
+                elif VERSION_SUFFIX_RE.match(name):
+                    row["label"] = "entity-versioned"
+                else:
+                    row["label"] = "entity"
+            else:
+                row["label"] = "file"
+            if row["label"] in ("entity", "entity-versioned", "nested-git",
+                                "external-link", "cross-link"):
+                row["suggested_name"] = normalize_name(name)
+                row["has_skill_md"] = os.path.exists(
+                    os.path.join(os.path.realpath(fp), "SKILL.md"))
+            rows.append(row)
+
+    # dedup analysis across adoptable rows
+    adoptable = {}
+    for row in rows:
+        if row["label"] in ("entity", "entity-versioned", "nested-git",
+                            "external-link", "cross-link"):
+            real = os.path.realpath(row["path"])
+            adoptable.setdefault(row["suggested_name"], {})[real] = row
+    conflicts = []
+    for sname, by_real in adoptable.items():
+        if len(by_real) > 1:
+            hashes = {real: tree_hash(real) for real in by_real}
+            if len(set(hashes.values())) > 1:
+                conflicts.append(sname)
+                for real, row in by_real.items():
+                    row["dedup"] = "CONFLICT"
+                    row["tree_hash"] = hashes[real]
+            else:
+                for i, (real, row) in enumerate(sorted(by_real.items())):
+                    row["dedup"] = "primary" if i == 0 else "duplicate"
+        else:
+            next(iter(by_real.values()))["dedup"] = "unique"
+
+    counts = {}
+    for row in rows:
+        counts[row["label"]] = counts.get(row["label"], 0) + 1
+    rep.data = {"rows": rows, "counts": counts, "conflicts": conflicts,
+                "generated_at": now_iso()}
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump(rep.data, fh, ensure_ascii=False, indent=2)
+        rep.act(f"census written to {args.out}")
+    rep.act(f"scanned {len(rows)} entries: " +
+            ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    if conflicts:
+        rep.warn(f"{len(conflicts)} same-name-different-content conflicts: "
+                 + ", ".join(conflicts))
+
+
+# ---------------------------------------------------------------- adopt
+
+
+def _adopt_one(rep, lock, src_path, name, origin, source_spec, manifest_names):
+    dst = p("skills", name)
+    if os.path.exists(dst):
+        rep.warn(f"skills/{name} already exists — skipped {src_path}")
+        return False
+    copy_tree(src_path, dst)
+    entry = {"origin": origin, "local_hash": tree_hash(dst),
+             "adopted_at": now_iso()}
+    if origin == "vendor":
+        up = p("upstream", name)
+        copy_tree(src_path, up)
+        entry["upstream_hash"] = tree_hash(up)
+        entry["patched"] = False
+        if source_spec:
+            entry["source"] = source_spec
+        if name not in manifest_names:
+            append_manifest_skill(name, "vendor", source_spec)
+    if normalize_name(os.path.basename(src_path)) != name or \
+            os.path.basename(src_path) != name:
+        entry["aliases"] = [os.path.basename(src_path)]
+    lock["skills"][name] = entry
+    rep.act(f"adopted {name} ({origin}) <- {src_path}")
+    return True
+
+
+def cmd_adopt(args, rep):
+    manifest = load_manifest()
+    manifest_names = set(manifest.get("skills", {}).keys())
+    lock = load_lock()
+    adopted = 0
+    if args.from_census:
+        with open(args.from_census) as fh:
+            census = json.load(fh)
+        seen_real = set()
+        for row in census["rows"]:
+            label = row.get("label")
+            if label not in ("entity", "entity-versioned", "nested-git",
+                            "external-link", "cross-link"):
+                continue
+            if row.get("dedup") in ("duplicate",):
+                continue
+            if row.get("dedup") == "CONFLICT":
+                rep.attention(
+                    f"name conflict '{row['suggested_name']}': {row['path']} "
+                    f"(hash {row.get('tree_hash', '?')[:18]}…) — resolve manually "
+                    f"with `hub adopt <path> --name <other-name>`")
+                continue
+            real = os.path.realpath(row["path"])
+            if real in seen_real:
+                continue
+            seen_real.add(real)
+            name = row["suggested_name"]
+            remote = row.get("git_remote")
+            if remote:
+                spec = f"git+{remote}#ref=main"
+                if row.get("subdir") and row["subdir"] != ".":
+                    spec += f"&subdir={row['subdir']}"
+                origin, source_spec = "vendor", spec
+            else:
+                origin, source_spec = "self", None
+            if _adopt_one(rep, lock, real, name, origin, source_spec,
+                          manifest_names):
+                manifest_names.add(name)
+                adopted += 1
+    else:
+        if not args.path:
+            rep.fail("adopt needs a PATH or --from-census FILE", 2)
+            return
+        src = os.path.abspath(os.path.expanduser(args.path))
+        if not os.path.isdir(src):
+            rep.fail(f"{src} is not a directory", 2)
+            return
+        name = normalize_name(args.name or os.path.basename(src))
+        if not NAME_RE.match(name):
+            rep.fail(f"cannot normalize '{name}' to a valid skill name", 2)
+            return
+        origin = args.origin or "self"
+        source_spec = args.source
+        if origin == "vendor" and not source_spec:
+            top, remote = _git_top_and_remote(src)
+            if remote:
+                sub = os.path.relpath(src, top)
+                source_spec = f"git+{remote}#ref=main" + (
+                    f"&subdir={sub}" if sub != "." else "")
+        if _adopt_one(rep, lock, src, name, origin, source_spec, manifest_names):
+            adopted += 1
+    save_lock(lock)
+    rep.data["adopted"] = adopted
+
+
+# ---------------------------------------------------------------- materialize / sync
+
+
+def materialize(manifest, dev, rep, dry=False):
+    enabled = expand_enabled(manifest, dev, rep)
+    rep.data["enabled"] = enabled
+    hub_skills_real = os.path.realpath(p("skills"))
+    skills_meta = manifest.get("skills", {})
+    default_agents = manifest.get("hub", {}).get("default_agents", [])
+    agents_cfg = manifest.get("agents", {})
+    foreign = []
+    for agent in dev.get("agents", []):
+        cfg = agents_cfg.get(agent)
+        if not cfg:
+            rep.warn(f"device references unknown agent '{agent}'")
+            continue
+        target = os.path.expanduser(cfg["target"])
+        mode = cfg.get("mode", "symlink")
+        protect = set(cfg.get("protect", [])) | PROTECT_ALWAYS
+        if os.path.islink(target):
+            rep.attention(f"target {target} is itself a symlink — refusing")
+            continue
+        if not os.path.isdir(target):
+            if dry:
+                rep.act(f"[dry] mkdir {target}")
+            else:
+                os.makedirs(target, exist_ok=True)
+                rep.act(f"mkdir {target}")
+        want = [s for s in enabled
+                if agent in skills_meta.get(s, {}).get("agents", default_agents)]
+        state_fp = os.path.join(target, ".hub-state.json")
+        state = {"managed": []}
+        if mode == "copy" and os.path.exists(state_fp):
+            try:
+                state = json.load(open(state_fp))
+            except json.JSONDecodeError:
+                pass
+        # 1) place/refresh
+        for s in want:
+            src = os.path.join(hub_skills_real, s)
+            dst = os.path.join(target, s)
+            if mode == "symlink":
+                if os.path.islink(dst) and os.readlink(dst) == src:
+                    continue
+                if dry:
+                    rep.act(f"[dry] link {dst} -> {src}")
+                    continue
+                if os.path.isdir(dst) and not os.path.islink(dst):
+                    foreign.append((agent, dst, "entity blocks managed link"))
+                    continue
+                tmp = dst + ".hub-tmp"
+                if os.path.lexists(tmp):
+                    os.remove(tmp)
+                os.symlink(src, tmp)
+                os.replace(tmp, dst)
+                rep.act(f"link {agent}:{s}")
+            else:  # copy
+                if dry:
+                    rep.act(f"[dry] copy {dst}")
+                    continue
+                if not os.path.exists(dst) or tree_hash(dst) != tree_hash(src):
+                    copy_tree(src, dst)
+                    rep.act(f"copy {agent}:{s}")
+                if s not in state["managed"]:
+                    state["managed"].append(s)
+        # 2) cleanup
+        if os.path.isdir(target):
+            for entry in sorted(os.listdir(target)):
+                if entry in protect or entry == ".hub-state.json":
+                    continue
+                fp = os.path.join(target, entry)
+                if os.path.islink(fp):
+                    tgt = os.readlink(fp)
+                    real = os.path.realpath(fp)
+                    if CACHE_MARKER in tgt or CACHE_MARKER in real:
+                        _rm(fp, dry, rep, f"cache-link {agent}:{entry} (铁律2)")
+                    elif not os.path.exists(fp):
+                        _rm(fp, dry, rep, f"broken link {agent}:{entry}")
+                    elif real.startswith(hub_skills_real + os.sep) and \
+                            entry not in want:
+                        _rm(fp, dry, rep, f"stale hub link {agent}:{entry}")
+                    elif not real.startswith(hub_skills_real + os.sep):
+                        foreign.append((agent, fp, "foreign link"))
+                elif os.path.isdir(fp):
+                    if mode == "copy" and entry in state["managed"] and \
+                            entry not in want:
+                        if dry:
+                            rep.act(f"[dry] rm copied {agent}:{entry}")
+                        else:
+                            shutil.rmtree(fp)
+                            state["managed"].remove(entry)
+                            rep.act(f"rm copied {agent}:{entry}")
+                    elif not (mode == "copy" and entry in state["managed"]):
+                        foreign.append((agent, fp, "foreign entity"))
+        if mode == "copy" and not dry:
+            state["managed"] = sorted(set(state["managed"]) & set(want)
+                                      | (set(state["managed"]) & set(want)))
+            state["managed"] = sorted(set(state["managed"]))
+            with open(state_fp, "w") as fh:
+                json.dump(state, fh, indent=2)
+                fh.write("\n")
+    if foreign:
+        rep.data["foreign"] = [f"{a}:{path} ({why})" for a, path, why in foreign]
+        rep.warn(f"{len(foreign)} foreign entries left untouched "
+                 f"(see data.foreign; `hub adopt` or ignore)")
+
+
+def _rm(fp, dry, rep, why):
+    if dry:
+        rep.act(f"[dry] rm {why}")
+    else:
+        os.remove(fp)
+        rep.act(f"rm {why}")
+
+
+def cmd_sync(args, rep):
+    manifest = load_manifest()
+    did = device_id(rep)
+    if not did:
+        return
+    dev = load_device(did)
+    rep.data["device"] = did
+    dry = args.dry_run
+    # 1) adopt drift
+    st = git(["status", "--porcelain"]).stdout.strip()
+    if st:
+        n = len(st.splitlines())
+        if dry:
+            rep.act(f"[dry] would auto-commit {n} drifted change(s)")
+        else:
+            git(["add", "-A"])
+            git(["commit", "--quiet", "-m",
+                 f"sync({did}): auto-commit drift ({n} changes)"])
+            rep.act(f"auto-committed {n} drifted change(s)")
+    # 2) pull --rebase
+    if has_remote() and not args.no_pull and not dry:
+        r = run(["git", "pull", "--rebase", "--autostash", "--quiet"],
+                cwd=HUB_ROOT, check=False)
+        if r.returncode != 0:
+            run(["git", "rebase", "--abort"], cwd=HUB_ROOT, check=False)
+            needs_attention_write(
+                f"sync({did}): rebase conflict",
+                ["`git pull --rebase` hit conflicts and was aborted (worktree "
+                 "restored).", "Resolve in a session: pull, merge semantically, "
+                 "then `hub sync`.", f"git said: {r.stderr.strip()[:400]}"])
+            rep.attention("rebase conflict — aborted, details in NEEDS_ATTENTION.md")
+            return
+        rep.act("pulled (rebase)")
+    # 3) materialize
+    materialize(manifest, dev, rep, dry=dry)
+    # 4) push
+    if has_remote() and not args.no_push and not dry:
+        r = run(["git", "push", "--quiet"], cwd=HUB_ROOT, check=False)
+        if r.returncode == 0:
+            rep.act("pushed")
+        else:
+            rep.warn(f"push skipped ({r.stderr.strip().splitlines()[-1] if r.stderr else 'error'})")
+    # 5) refresh lock local hashes
+    if not dry:
+        lock = load_lock()
+        changed = False
+        for name in skill_names():
+            e = lock["skills"].setdefault(name, {"origin": "self"})
+            h = tree_hash(p("skills", name))
+            if e.get("local_hash") != h:
+                e["local_hash"] = h
+                e["updated_at"] = now_iso()
+                changed = True
+            if "upstream_hash" in e:
+                e["patched"] = e["upstream_hash"] != h
+        for name in list(lock["skills"]):
+            if name not in skill_names():
+                del lock["skills"][name]
+                changed = True
+        if changed:
+            save_lock(lock)
+            st2 = git(["status", "--porcelain"]).stdout.strip()
+            if st2:
+                git(["add", "hub.lock.json"])
+                git(["commit", "--quiet", "-m", f"sync({did}): refresh lock"])
+                if has_remote() and not args.no_push:
+                    run(["git", "push", "--quiet"], cwd=HUB_ROOT, check=False)
+        os.makedirs(p(".logs"), exist_ok=True)
+        with open(p(".logs", "last_sync"), "w") as fh:
+            fh.write(now_iso() + "\n")
+
+
+# ---------------------------------------------------------------- install / update
+
+
+def cmd_install(args, rep):
+    manifest = load_manifest()
+    src = parse_source(args.source)
+    if not src:
+        rep.fail(f"cannot parse source '{args.source}' "
+                 f"(use git+URL#ref=..&subdir=.. or a local path)", 2)
+        return
+    lock = load_lock()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            content, commit = fetch_upstream(src, tmp)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            rep.fail(f"fetch failed: {e}", 2)
+            return
+        name = normalize_name(args.name or os.path.basename(
+            src.get("subdir") or os.path.basename(content)))
+        if not NAME_RE.match(name):
+            rep.fail(f"bad skill name '{name}'", 2)
+            return
+        if os.path.exists(p("skills", name)):
+            rep.fail(f"skills/{name} already exists (use `hub update {name}`)", 2)
+            return
+        copy_tree(content, p("upstream", name))
+        copy_tree(content, p("skills", name))
+    spec = source_to_spec(src)
+    append_manifest_skill(name, "vendor", spec)
+    entry = {"origin": "vendor", "source": spec, "patched": False,
+             "vendored_at": now_iso(),
+             "upstream_hash": tree_hash(p("upstream", name)),
+             "local_hash": tree_hash(p("skills", name))}
+    if commit:
+        entry["upstream_commit"] = commit
+    lock["skills"][name] = entry
+    save_lock(lock)
+    if args.profile:
+        _add_to_profile(name, args.profile, rep)
+    if not args.no_git:
+        git(["add", "-A"])
+        git(["commit", "--quiet", "-m",
+             f"hub: install {name} ({spec}" + (f"@{commit[:9]}" if commit else "") + ")"])
+        rep.act("committed")
+    rep.act(f"installed {name}; enable it in a profile/device then `hub sync`")
+    rep.data["name"] = name
+
+
+def _add_to_profile(name, profile, rep):
+    """Text surgery: append name to an existing single-line profile array."""
+    fp = p("hub.toml")
+    text = open(fp).read()
+    pat = re.compile(rf'^({re.escape(profile)}\s*=\s*\[)(.*?)(\])',
+                     re.MULTILINE)
+    m = pat.search(text)
+    if not m:
+        rep.warn(f"profile '{profile}' not found as single-line array — "
+                 f"add \"{name}\" to it manually")
+        return
+    inner = m.group(2).strip()
+    if f'"{name}"' in inner:
+        return
+    new_inner = (inner + ", " if inner else "") + f'"{name}"'
+    text = text[:m.start()] + m.group(1) + new_inner + m.group(3) + text[m.end():]
+    with open(fp, "w") as fh:
+        fh.write(text)
+    rep.act(f"added {name} to profile '{profile}'")
+
+
+def _merge_trees(base, ours, theirs, rep, name):
+    """Per-file 3-way merge applied in place to `ours`. Returns conflict list."""
+    conflicts = []
+
+    def files_of(root):
+        out = set()
+        if not os.path.isdir(root):
+            return out
+        for r, ds, fs in os.walk(root):
+            ds[:] = [d for d in ds if d != ".git"]
+            for f in fs:
+                if f != ".DS_Store":
+                    out.add(os.path.relpath(os.path.join(r, f), root))
+        return out
+
+    fb, fo, ft = files_of(base), files_of(ours), files_of(theirs)
+
+    def read(root, rel):
+        fp = os.path.join(root, rel)
+        return open(fp, "rb").read() if os.path.exists(fp) else None
+
+    for rel in sorted(fb | fo | ft):
+        b, o, t = (read(base, rel), read(ours, rel), read(theirs, rel))
+        dst = os.path.join(ours, rel)
+        if t is not None and o is None and b is None:            # upstream added
+            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            shutil.copy2(os.path.join(theirs, rel), dst)
+        elif t is None and b is not None and o == b:             # upstream deleted, ours untouched
+            if os.path.exists(dst):
+                os.remove(dst)
+        elif t is None and b is not None and o != b and o is not None:
+            conflicts.append(f"{rel}: upstream deleted but locally modified")
+        elif o is None and b is not None and t != b:
+            conflicts.append(f"{rel}: locally deleted but upstream modified")
+        elif o is not None and t is not None:
+            if o == t or t == b:
+                continue                                          # nothing to take
+            if o == b:                                            # only upstream changed
+                shutil.copy2(os.path.join(theirs, rel), dst)
+                continue
+            # both changed -> git merge-file
+            with tempfile.TemporaryDirectory() as td:
+                bo = os.path.join(td, "base")
+                open(bo, "wb").write(b if b is not None else b"")
+                th = os.path.join(td, "theirs")
+                open(th, "wb").write(t)
+                r = run(["git", "merge-file", "-L", "local", "-L", "base",
+                         "-L", "upstream", dst, bo, th], check=False)
+                if r.returncode != 0:
+                    conflicts.append(f"{rel}: content conflict (markers left in file)")
+    return conflicts
+
+
+def cmd_update(args, rep):
+    manifest = load_manifest()
+    lock = load_lock()
+    targets = args.names or []
+    if args.all or not targets:
+        targets = [n for n, e in lock["skills"].items()
+                   if e.get("origin") == "vendor"]
+    if args.cont:
+        _update_continue(args, rep, lock)
+        return
+    updates, skipped = [], []
+    for name in targets:
+        e = lock["skills"].get(name)
+        mskill = manifest.get("skills", {}).get(name, {})
+        if not e or e.get("origin") != "vendor":
+            skipped.append(f"{name} (not vendor)")
+            continue
+        if mskill.get("pin"):
+            skipped.append(f"{name} (pinned)")
+            continue
+        spec = e.get("source") or mskill.get("source")
+        src = parse_source(spec) if spec else None
+        if not src:
+            skipped.append(f"{name} (no parsable source)")
+            continue
+        if src["type"] == "git" and e.get("upstream_commit"):
+            r = run(["git", "ls-remote", src["url"],
+                     src.get("ref", "main")], check=False)
+            if r.returncode != 0:
+                rep.warn(f"{name}: ls-remote failed")
+                continue
+            head = r.stdout.split()[0] if r.stdout.split() else None
+            if head == e["upstream_commit"]:
+                continue
+        updates.append((name, src, e))
+    if skipped:
+        rep.data["skipped"] = skipped
+    if args.check:
+        rep.data["updatable"] = [n for n, _, _ in updates]
+        rep.act(f"{len(updates)} skill(s) have upstream updates: "
+                + (", ".join(n for n, _, _ in updates) or "none"))
+        if updates and args.write_attention:
+            needs_attention_write("update --check", [
+                f"`hub update {n}` available" for n, _, _ in updates])
+        return
+    for name, src, e in updates:
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                content, commit = fetch_upstream(src, tmp)
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                rep.warn(f"{name}: fetch failed: {exc}")
+                continue
+            pending = p(".hub-pending", name)
+            copy_tree(content, pending)
+        conflicts = _merge_trees(p("upstream", name), p("skills", name),
+                                 pending, rep, name)
+        if conflicts:
+            meta = {"commit": commit, "started": now_iso()}
+            with open(pending + ".meta.json", "w") as fh:
+                json.dump(meta, fh)
+            needs_attention_write(f"update {name}: conflicts", conflicts + [
+                f"Resolve markers in skills/{name}/, then `hub update {name} --continue`"])
+            rep.attention(f"{name}: {len(conflicts)} conflict(s) — resolve then "
+                          f"`hub update {name} --continue`")
+            continue
+        copy_tree(pending, p("upstream", name))
+        shutil.rmtree(pending, ignore_errors=True)
+        e["upstream_hash"] = tree_hash(p("upstream", name))
+        e["local_hash"] = tree_hash(p("skills", name))
+        e["patched"] = e["upstream_hash"] != e["local_hash"]
+        if commit:
+            old = e.get("upstream_commit", "")[:9]
+            e["upstream_commit"] = commit
+        e["updated_at"] = now_iso()
+        save_lock(lock)
+        if not args.no_git:
+            git(["add", "-A"])
+            git(["commit", "--quiet", "-m",
+                 f"hub: update {name} ({old + '..' if commit and old else ''}"
+                 f"{commit[:9] if commit else 'local'})"])
+        rep.act(f"updated {name}" + (" (local patches preserved)" if e["patched"] else ""))
+
+
+def _update_continue(args, rep, lock):
+    for name in args.names or []:
+        pending = p(".hub-pending", name)
+        if not os.path.isdir(pending):
+            rep.fail(f"no pending update for {name}", 2)
+            return
+        # refuse if conflict markers remain
+        bad = []
+        for r, ds, fs in os.walk(p("skills", name)):
+            for f in fs:
+                fp = os.path.join(r, f)
+                try:
+                    if b"<<<<<<<" in open(fp, "rb").read():
+                        bad.append(os.path.relpath(fp, p("skills", name)))
+                except OSError:
+                    pass
+        if bad:
+            rep.attention(f"{name}: conflict markers remain in: " + ", ".join(bad))
+            return
+        meta = {}
+        meta_fp = pending + ".meta.json"
+        if os.path.exists(meta_fp):
+            meta = json.load(open(meta_fp))
+            os.remove(meta_fp)
+        copy_tree(pending, p("upstream", name))
+        shutil.rmtree(pending)
+        e = lock["skills"][name]
+        e["upstream_hash"] = tree_hash(p("upstream", name))
+        e["local_hash"] = tree_hash(p("skills", name))
+        e["patched"] = e["upstream_hash"] != e["local_hash"]
+        if meta.get("commit"):
+            e["upstream_commit"] = meta["commit"]
+        e["updated_at"] = now_iso()
+        save_lock(lock)
+        git(["add", "-A"])
+        git(["commit", "--quiet", "-m", f"hub: update {name} (conflicts resolved)"])
+        rep.act(f"update of {name} finalized")
+
+
+# ---------------------------------------------------------------- doctor / status / diff
+
+
+def cmd_doctor(args, rep):
+    manifest = load_manifest()
+    lock = load_lock()
+    issues = []
+
+    def issue(code, msg, fixable=False):
+        issues.append({"check": code, "msg": msg, "fixable": fixable})
+
+    # targets from all devices' agents? use manifest agents (all targets)
+    for aname, cfg in manifest.get("agents", {}).items():
+        target = os.path.expanduser(cfg["target"])
+        if not os.path.isdir(target):
+            continue
+        protect = set(cfg.get("protect", [])) | PROTECT_ALWAYS
+        hub_real = os.path.realpath(p("skills"))
+        for entry in sorted(os.listdir(target)):
+            if entry in protect or entry == ".hub-state.json":
+                continue
+            fp = os.path.join(target, entry)
+            if os.path.islink(fp):
+                tgt = os.readlink(fp)
+                real = os.path.realpath(fp)
+                if CACHE_MARKER in tgt or CACHE_MARKER in real:
+                    issue(2, f"cache link {aname}:{entry}", fixable=True)
+                    if args.fix:
+                        os.remove(fp)
+                        rep.act(f"fixed: rm cache link {aname}:{entry}")
+                elif not os.path.exists(fp):
+                    issue(1, f"broken link {aname}:{entry}", fixable=True)
+                    if args.fix:
+                        os.remove(fp)
+                        rep.act(f"fixed: rm broken link {aname}:{entry}")
+                elif not real.startswith(hub_real + os.sep):
+                    issue(3, f"foreign link {aname}:{entry} -> {tgt}")
+            elif os.path.isdir(fp):
+                issue(3, f"foreign entity {aname}:{entry} (consider `hub adopt`)")
+    # 4 nested git
+    for layer in ("skills", "upstream"):
+        base = p(layer)
+        if not os.path.isdir(base):
+            continue
+        for r, ds, fs in os.walk(base):
+            if ".git" in ds:
+                issue(4, f"nested .git at {os.path.relpath(r, HUB_ROOT)}/.git")
+                ds.remove(".git")
+    # 5 name compliance
+    for name in skill_names():
+        if not NAME_RE.match(name):
+            issue(5, f"non-compliant skill name '{name}'")
+    # 6 manifest refs
+    names = set(skill_names())
+    referenced = set()
+    for prof, pats in manifest.get("profiles", {}).items():
+        for pat in pats:
+            hits = fnmatch.filter(sorted(names), pat)
+            referenced.update(hits)
+            if not hits:
+                issue(6, f"profile '{prof}' pattern '{pat}' matches nothing")
+    orphan = names - referenced - {"skill-hub"}
+    if orphan:
+        issue(6, f"{len(orphan)} skill(s) in no profile: "
+              + ", ".join(sorted(orphan)[:10]) + ("…" if len(orphan) > 10 else ""))
+    # 7 lock drift
+    for name in names:
+        e = lock["skills"].get(name)
+        if e and e.get("local_hash") and \
+                e["local_hash"] != tree_hash(p("skills", name)):
+            issue(7, f"lock hash drift for {name} (uncommitted edit?)",
+                  fixable=True)
+    # 8 git state
+    if git(["status", "--porcelain"]).stdout.strip():
+        issue(8, "hub repo has uncommitted changes (run `hub sync`)", fixable=True)
+    if has_remote():
+        run(["git", "fetch", "--quiet"], cwd=HUB_ROOT, check=False)
+        r = run(["git", "rev-list", "--left-right", "--count",
+                 "@{upstream}...HEAD"], cwd=HUB_ROOT, check=False)
+        if r.returncode == 0:
+            behind, ahead = (int(x) for x in r.stdout.split())
+            if behind:
+                issue(8, f"hub repo is {behind} commit(s) behind remote")
+            if ahead:
+                issue(8, f"hub repo is {ahead} commit(s) ahead (unpushed)")
+    # 9 old-clone revival
+    for d in ("~/.claude/skills", "~/.agents/skills"):
+        gd = os.path.expanduser(d + "/.git")
+        if os.path.exists(gd) and os.path.realpath(
+                os.path.expanduser(d)) != os.path.realpath(HUB_ROOT):
+            issue(9, f"RED: {d} is a git repo again (old dual-clone revival!)")
+    # 12 schedule health
+    if not os.path.exists(DEVICE_FILE):
+        issue(12, f"device id file missing ({DEVICE_FILE})")
+    ls = p(".logs", "last_sync")
+    if os.path.exists(ls):
+        try:
+            last = datetime.datetime.fromisoformat(open(ls).read().strip())
+            age = (datetime.datetime.now().astimezone() - last).days
+            if age >= 3:
+                issue(12, f"last sync {age} days ago")
+        except ValueError:
+            pass
+    # 13 merge driver
+    r = git(["config", "merge.hub-lock.driver"], check=False)
+    if r.returncode != 0:
+        issue(13, "hub-lock merge driver NOT registered in this clone "
+              "(run `hub onboard`)")
+    if args.fix and any(i["check"] in (7, 8) and i["fixable"] for i in issues):
+        st = git(["status", "--porcelain"]).stdout.strip()
+        if st:
+            git(["add", "-A"])
+            git(["commit", "--quiet", "-m", "hub: doctor --fix commit drift"])
+            rep.act("fixed: committed drift")
+    rep.data["issues"] = issues
+    if issues:
+        rep.warn(f"{len(issues)} issue(s) found")
+        if args.write_attention:
+            needs_attention_write("doctor findings",
+                                  [f"[{i['check']}] {i['msg']}" for i in issues])
+    else:
+        rep.act("all checks green ✔")
+
+
+def cmd_status(args, rep):
+    manifest = load_manifest()
+    lock = load_lock()
+    rep.data["root"] = HUB_ROOT
+    did = None
+    if os.path.exists(DEVICE_FILE):
+        did = open(DEVICE_FILE).read().strip()
+    rep.data["device"] = did
+    if did and os.path.exists(p("devices", f"{did}.toml")):
+        dev = load_device(did)
+        enabled = expand_enabled(manifest, dev)
+        rep.data["enabled"] = enabled
+        rep.data["agents"] = dev.get("agents", [])
+    rep.data["skills_total"] = len(skill_names())
+    rep.data["patched"] = sorted(
+        n for n, e in lock["skills"].items() if e.get("patched"))
+    st = git(["status", "--porcelain"], check=False)
+    rep.data["git_dirty"] = len(st.stdout.strip().splitlines()) if st.stdout else 0
+    ls = p(".logs", "last_sync")
+    rep.data["last_sync"] = open(ls).read().strip() if os.path.exists(ls) else None
+    if not args.json:
+        d = rep.data
+        print(f"hub @ {d['root']}  device={d['device']}")
+        print(f"skills: {d['skills_total']} total, "
+              f"{len(d.get('enabled', []))} enabled on this device, "
+              f"{len(d['patched'])} patched")
+        if d["patched"]:
+            print("patched: " + ", ".join(d["patched"]))
+        print(f"git: {d['git_dirty']} dirty · last sync {d['last_sync']}")
+
+
+def cmd_diff(args, rep):
+    up = p("upstream", args.name)
+    sk = p("skills", args.name)
+    if not os.path.isdir(up):
+        rep.fail(f"{args.name} has no upstream snapshot (origin=self?)", 2)
+        return
+    r = run(["diff", "-ru", "-x", ".DS_Store", up, sk], check=False)
+    print(r.stdout, end="")
+    rep.data["differs"] = r.returncode != 0
+
+
+# ---------------------------------------------------------------- lock merge driver
+
+
+def cmd_lock_merge(args, rep):
+    def load(fp):
+        try:
+            return json.load(open(fp))
+        except (json.JSONDecodeError, OSError):
+            return None
+    base, ours, theirs = load(args.base), load(args.ours), load(args.theirs)
+    if ours is None or theirs is None:
+        sys.exit(1)
+    merged = {"schema": SCHEMA, "skills": {}}
+    keys = set(ours.get("skills", {})) | set(theirs.get("skills", {}))
+    for k in keys:
+        o = ours.get("skills", {}).get(k)
+        t = theirs.get("skills", {}).get(k)
+        if o is None:
+            merged["skills"][k] = t
+        elif t is None:
+            merged["skills"][k] = o
+        elif o == t:
+            merged["skills"][k] = o
+        else:
+            ou, tu = o.get("updated_at", ""), t.get("updated_at", "")
+            merged["skills"][k] = o if ou >= tu else t
+    with open(args.ours, "w") as fh:
+        json.dump(merged, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------- selftest
+
+
+def cmd_selftest(args, rep):
+    """End-to-end dry run in a temp sandbox. Never touches the real hub."""
+    failures = []
+
+    def check(cond, label):
+        (rep.act if cond else failures.append)(
+            f"PASS {label}" if cond else f"FAIL {label}")
+
+    with tempfile.TemporaryDirectory() as td:
+        global HUB_ROOT, DEVICE_FILE
+        real_root, real_dev = HUB_ROOT, DEVICE_FILE
+        HUB_ROOT = os.path.join(td, "hub")
+        DEVICE_FILE = os.path.join(td, "device-id")
+        try:
+            env_git = {"GIT_AUTHOR_NAME": "selftest", "GIT_AUTHOR_EMAIL": "t@t",
+                       "GIT_COMMITTER_NAME": "selftest", "GIT_COMMITTER_EMAIL": "t@t"}
+            os.environ.update(env_git)
+            # fake upstream repo with one skill
+            upstream = os.path.join(td, "up")
+            os.makedirs(os.path.join(upstream, "skills", "demo"))
+            open(os.path.join(upstream, "skills", "demo", "SKILL.md"),
+                 "w").write("---\nname: demo\n---\nv1 line-a\nline-b\n")
+            for c in (["init", "--quiet"], ["add", "-A"],
+                      ["commit", "--quiet", "-m", "v1"],
+                      ["branch", "-m", "main"]):
+                run(["git", "-C", upstream] + c)
+            # init instance
+            a = _parse(["init"])
+            _dispatch(a, Report("init"))
+            check(os.path.exists(p("hub.toml")), "init scaffolds hub.toml")
+            # agents targets -> tmp dirs
+            claude_t = os.path.join(td, "t-claude")
+            agents_t = os.path.join(td, "t-agents")
+            manifest_txt = open(p("hub.toml")).read()
+            manifest_txt = manifest_txt.replace("~/.claude/skills", claude_t)
+            manifest_txt = manifest_txt.replace("~/.agents/skills", agents_t)
+            open(p("hub.toml"), "w").write(manifest_txt)
+            git(["add", "-A"])
+            git(["commit", "--quiet", "-m", "scaffold"])
+            # onboard
+            r0 = Report("onboard")
+            _dispatch(_parse(["onboard", "--device", "testbox", "--no-bin"]), r0)
+            check(open(DEVICE_FILE).read().strip() == "testbox", "onboard writes device id")
+            check(git(["config", "merge.hub-lock.driver"],
+                      check=False).returncode == 0, "merge driver registered")
+            # self-written skill
+            os.makedirs(p("skills", "mine"))
+            open(p("skills", "mine", "SKILL.md"), "w").write("---\nname: mine\n---\nhi\n")
+            # install from fake upstream
+            r1 = Report("install")
+            _dispatch(_parse(["install",
+                              f"git+file://{upstream}#ref=main&subdir=skills/demo",
+                              "--profile", "base"]), r1)
+            check(r1.ok and os.path.exists(p("skills", "demo", "SKILL.md")),
+                  "install vendors skill")
+            check(os.path.exists(p("upstream", "demo", "SKILL.md")),
+                  "install writes pristine upstream")
+            check('"demo"' in open(p("hub.toml")).read(), "install appends manifest+profile")
+            # enable mine via extra
+            dev_fp = p("devices", "testbox.toml")
+            open(dev_fp, "a").write('\n')
+            txt = open(dev_fp).read().replace("extra    = []", 'extra    = ["mine"]')
+            open(dev_fp, "w").write(txt)
+            # sync (local mode, no remote)
+            r2 = Report("sync")
+            _dispatch(_parse(["sync"]), r2)
+            check(r2.exit_code == 0, "sync ok (local mode)")
+            check(os.path.islink(os.path.join(claude_t, "demo")), "materialized demo link")
+            check(os.path.islink(os.path.join(agents_t, "mine")), "materialized mine link")
+            # cleanup behaviors: plant a cache link + broken link + foreign
+            os.symlink("/nonexistent/plugins/cache/x/skills/y",
+                       os.path.join(claude_t, "evil-cache"))
+            os.symlink("/nonexistent/gone", os.path.join(claude_t, "dead"))
+            os.makedirs(os.path.join(claude_t, "stranger"))
+            r3 = Report("sync2")
+            _dispatch(_parse(["sync"]), r3)
+            check(not os.path.lexists(os.path.join(claude_t, "evil-cache")),
+                  "sync kills cache links")
+            check(not os.path.lexists(os.path.join(claude_t, "dead")),
+                  "sync kills broken links")
+            check(os.path.isdir(os.path.join(claude_t, "stranger")),
+                  "sync leaves foreign entities")
+            # disable demo -> link removed
+            txt = open(dev_fp).read().replace('disable  = []', 'disable  = ["demo"]')
+            open(dev_fp, "w").write(txt)
+            r4 = Report("sync3")
+            _dispatch(_parse(["sync"]), r4)
+            check(not os.path.lexists(os.path.join(claude_t, "demo")),
+                  "disable removes stale hub link")
+            txt = open(dev_fp).read().replace('disable  = ["demo"]', 'disable  = []')
+            open(dev_fp, "w").write(txt)
+            _dispatch(_parse(["sync"]), Report("sync4"))
+            # upstream evolves + local patch -> clean 3-way merge
+            open(p("skills", "demo", "SKILL.md"), "a").write("local-patch\n")
+            up_fp = os.path.join(upstream, "skills", "demo", "SKILL.md")
+            open(up_fp, "w").write("---\nname: demo\n---\nv2 line-a\nline-b\n")
+            open(os.path.join(upstream, "skills", "demo", "NEW.md"), "w").write("new\n")
+            run(["git", "-C", upstream, "add", "-A"])
+            run(["git", "-C", upstream, "commit", "--quiet", "-m", "v2"])
+            r5 = Report("update")
+            _dispatch(_parse(["update", "demo"]), r5)
+            merged = open(p("skills", "demo", "SKILL.md")).read()
+            check("v2 line-a" in merged and "local-patch" in merged,
+                  "update merges upstream + keeps local patch")
+            check(os.path.exists(p("skills", "demo", "NEW.md")),
+                  "update brings upstream-added files")
+            lock = load_lock()
+            check(lock["skills"]["demo"].get("patched") is True,
+                  "lock marks demo as patched")
+            # conflicting change -> exit 1 + NEEDS_ATTENTION
+            open(p("skills", "demo", "SKILL.md"), "w").write(
+                "---\nname: demo\n---\nLOCAL line-a\nline-b\nlocal-patch\n")
+            _dispatch(_parse(["sync", "--no-push"]), Report("sync5"))
+            open(up_fp, "w").write("---\nname: demo\n---\nUPSTREAM line-a\nline-b\n")
+            run(["git", "-C", upstream, "add", "-A"])
+            run(["git", "-C", upstream, "commit", "--quiet", "-m", "v3"])
+            r6 = Report("update-conflict")
+            _dispatch(_parse(["update", "demo"]), r6)
+            check(r6.exit_code == 1, "conflicting update exits 1")
+            check(os.path.exists(p("NEEDS_ATTENTION.md")),
+                  "conflict recorded in NEEDS_ATTENTION.md")
+            check("<<<<<<<" in open(p("skills", "demo", "SKILL.md")).read(),
+                  "conflict markers left for agent")
+            # resolve + continue
+            open(p("skills", "demo", "SKILL.md"), "w").write(
+                "---\nname: demo\n---\nRESOLVED line-a\nline-b\nlocal-patch\n")
+            r7 = Report("continue")
+            _dispatch(_parse(["update", "demo", "--continue"]), r7)
+            check(r7.exit_code == 0, "update --continue finalizes")
+            # doctor should be green-ish (ignore orphan-profile info)
+            r8 = Report("doctor")
+            _dispatch(_parse(["doctor"]), r8)
+            hard = [i for i in r8.data.get("issues", [])
+                    if i["check"] in (1, 2, 4, 5, 13)]
+            check(not hard, f"doctor no hard issues (got {hard})")
+            # lock-merge driver: union of two divergent locks
+            lo = {"schema": 1, "skills": {"a": {"updated_at": "2026-01-01"}}}
+            lt = {"schema": 1, "skills": {"b": {"updated_at": "2026-01-02"}}}
+            fb = os.path.join(td, "b.json")
+            fo = os.path.join(td, "o.json")
+            ft = os.path.join(td, "t.json")
+            json.dump({"schema": 1, "skills": {}}, open(fb, "w"))
+            json.dump(lo, open(fo, "w"))
+            json.dump(lt, open(ft, "w"))
+            r9 = run([os.path.abspath(__file__), "lock-merge", fb, fo, ft],
+                     check=False)
+            got = json.load(open(fo))
+            check(r9.returncode == 0 and set(got["skills"]) == {"a", "b"},
+                  "lock-merge unions keys")
+        finally:
+            HUB_ROOT, DEVICE_FILE = real_root, real_dev
+    rep.data["failures"] = failures
+    if failures:
+        for f in failures:
+            rep.warn(f)
+        rep.fail(f"selftest: {len(failures)} failure(s)", 1)
+    else:
+        rep.act(f"selftest: all {len(rep.actions)} checks passed ✔")
+
+
+# ---------------------------------------------------------------- argparse / main
+
+
+def _parse(argv):
+    ap = argparse.ArgumentParser(prog="hub", description=__doc__)
+    ap.add_argument("--json", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init")
+    o = sub.add_parser("onboard")
+    o.add_argument("--device")
+    o.add_argument("--no-bin", action="store_true")
+    o.add_argument("--with-hook", action="store_true")
+    o.add_argument("--with-launchd", action="store_true")
+    c = sub.add_parser("census")
+    c.add_argument("--dirs", nargs="*")
+    c.add_argument("--out")
+    a = sub.add_parser("adopt")
+    a.add_argument("path", nargs="?")
+    a.add_argument("--from-census")
+    a.add_argument("--name")
+    a.add_argument("--origin", choices=["self", "vendor"])
+    a.add_argument("--source")
+    s = sub.add_parser("sync")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--no-push", action="store_true")
+    s.add_argument("--no-pull", action="store_true")
+    i = sub.add_parser("install")
+    i.add_argument("source")
+    i.add_argument("--name")
+    i.add_argument("--profile")
+    i.add_argument("--no-git", action="store_true")
+    u = sub.add_parser("update")
+    u.add_argument("names", nargs="*")
+    u.add_argument("--all", action="store_true")
+    u.add_argument("--check", action="store_true")
+    u.add_argument("--continue", dest="cont", action="store_true")
+    u.add_argument("--no-git", action="store_true")
+    u.add_argument("--write-attention", action="store_true")
+    d = sub.add_parser("doctor")
+    d.add_argument("--fix", action="store_true")
+    d.add_argument("--write-attention", action="store_true")
+    sub.add_parser("status")
+    df = sub.add_parser("diff")
+    df.add_argument("name")
+    lm = sub.add_parser("lock-merge")
+    lm.add_argument("base")
+    lm.add_argument("ours")
+    lm.add_argument("theirs")
+    sub.add_parser("selftest")
+    return ap.parse_args(argv)
+
+
+DISPATCH = {
+    "init": cmd_init, "onboard": cmd_onboard, "census": cmd_census,
+    "adopt": cmd_adopt, "sync": cmd_sync, "install": cmd_install,
+    "update": cmd_update, "doctor": cmd_doctor, "status": cmd_status,
+    "diff": cmd_diff, "lock-merge": cmd_lock_merge, "selftest": cmd_selftest,
+}
+
+
+def _dispatch(args, rep):
+    try:
+        DISPATCH[args.cmd](args, rep)
+    except FileNotFoundError as e:
+        rep.fail(str(e), 2)
+    except subprocess.CalledProcessError as e:
+        rep.fail(f"command failed: {e.cmd} → {(e.stderr or '').strip()[:300]}", 2)
+    return rep
+
+
+def main():
+    args = _parse(sys.argv[1:])
+    rep = _dispatch(args, Report(args.cmd))
+    sys.exit(rep.emit(getattr(args, "json", False)))
+
+
+if __name__ == "__main__":
+    main()

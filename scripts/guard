@@ -1,0 +1,19 @@
+#!/bin/bash
+# skill-hub SessionStart guard — REMIND ONLY, never mutate state.
+# Prints at most two short lines into the session context; silent when clean.
+HUB_ROOT="${SKILL_HUB_ROOT:-$HOME/skills-hub}"
+[ -d "$HUB_ROOT" ] || exit 0
+
+if [ -f "$HUB_ROOT/NEEDS_ATTENTION.md" ]; then
+  n=$(grep -c '^## ' "$HUB_ROOT/NEEDS_ATTENTION.md" 2>/dev/null || echo '?')
+  echo "skill-hub: $n pending item(s) in NEEDS_ATTENTION.md — say 「处理 hub 待办」 to handle them."
+fi
+
+last="$HUB_ROOT/.logs/last_sync"
+if [ -f "$last" ]; then
+  # portable-ish staleness check: file older than 3 days
+  if [ -n "$(find "$last" -mtime +3 -print 2>/dev/null)" ]; then
+    echo "skill-hub: last sync was over 3 days ago — consider running \`hub sync\`."
+  fi
+fi
+exit 0
