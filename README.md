@@ -2,13 +2,14 @@
 
 **One canonical library for all your agent skills — across agents, devices, and upstreams. Maintained by the agents themselves.**
 
-skill-hub is a small, dependency-free CLI (Python 3.11+ standard library) plus a `SKILL.md` that teaches your coding agent how to run it. It turns the sprawl of `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`, plugin caches, `npx` installers, cloned repos and hand-written one-offs into **one git repository** from which every agent's skill directory is rendered.
+skill-hub is a small, dependency-free CLI (one Python 3.11+ file, standard library only) plus a `SKILL.md` that teaches your coding agent how to run it. It turns the sprawl of `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`, plugin caches, `npx` installers, cloned repos and hand-written one-offs into **one git repository** from which every agent's skill directory is rendered.
 
 - [The problem](#the-problem)
 - [The doctrine](#the-doctrine)
+- [Four words you need](#four-words-you-need)
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
-- [Concepts](#concepts): [instance layout](#instance-layout) · [`hub.toml`](#hubtoml--the-manifest) · [device files](#deviceidtoml--per-device-selection) · [lockfile](#hublockjson--provenance) · [origins](#three-origins-self-vendor-external) · [selection algorithm](#selection-algorithm)
+- [Concepts](#concepts): [instance layout](#instance-layout) · [`hub.toml`](#hubtoml--the-manifest) · [device files](#deviceidtoml--per-device-selection) · [lockfile](#hublockjson--provenance) · [origins](#three-origins-self-vendor-external) · [why vendor, not submodules](#why-vendor-not-submodules) · [selection algorithm](#selection-algorithm)
 - [Materialization rules](#materialization-rules)
 - [`hub sync`](#hub-sync)
 - [Install and update (3-way merge)](#install-and-update-3-way-merge)
@@ -31,74 +32,102 @@ Every agent reads skills from its own directory. Skills arrive from many sources
 
 - Plugin caches rotate their hash-named directories on update; every symlink into them dies silently (a real machine had **104** of those).
 - Two directories end up as two clones of the same repo, each with hundreds of uncommitted changes, symlinked to each other in a loop.
-- Installers leave `foo-1.0.1` directories that no one updates; hand copies of upstream skills drift and can never be merged back.
+- Installers leave `foo-1.0.1` directories that no one updates; hand copies of upstream skills fork and can never be merged back.
 - A second machine is a re-do of all of the above.
 
 ## The doctrine
 
-1. **One canonical git repo** (the *instance*, default `~/skills-hub`) holds every skill as a real, vendored entity. Nothing else is a source of truth.
-2. **Discovery directories are render targets, not data.** `~/.claude/skills` and friends contain only per-skill symlinks (or managed copies) and can be deleted and rebuilt with one command.
-3. **Declarative selection.** `hub.toml` declares where things come from and how they group; `devices/<id>.toml` declares what each machine enables. One file per device, so manifests never conflict between machines.
-4. **Agents do the upkeep.** Every command is idempotent, has `--json` output, exit-code semantics and (where destructive) `--dry-run`. The bundled `SKILL.md` gives the agent the full routine. Humans state intent; agents run the plumbing.
+1. **One canonical git repo** (the *instance*, default `~/skills-hub`) holds every skill as a real, vendored directory. Nothing else is a source of truth.
+2. **Render targets are not data.** `~/.claude/skills` and friends (the directories agents read — called *render targets* below) contain only per-skill symlinks or managed copies. They can be deleted and rebuilt with one command.
+3. **Two layers, declared.** The library (`skills/`) can hold hundreds of skills; `devices/<id>.toml` says which of them *this machine* renders. Installing puts a skill in the library — enabling it is a separate, per-device decision. One file per device, so manifests never conflict between machines.
+4. **Agents do the upkeep.** Every command is idempotent, has `--json` output, exit-code semantics and a preview mode. The bundled `SKILL.md` gives the agent the full routine. Humans state intent; agents run the plumbing.
 
 Three iron rules fall out of this:
 
 | # | Rule |
 |---|---|
-| 1 | Entities exist **only** inside the instance's `skills/`. Agent directories hold links or managed copies. |
+| 1 | Real skill directories (*entities*) exist **only** inside the instance's `skills/`. Render targets hold links or managed copies. |
 | 2 | **Never** symlink anything under `~/.claude/plugins/cache/`. Plugin skills are the plugin system's job; a link into the cache is treated as damage and removed on sight. |
 | 3 | hub only deletes what it created (plus cache links and its own dead links). Everything else is *foreign*: reported, never touched. |
+
+## Four words you need
+
+| word | meaning |
+|---|---|
+| **instance** | your library repo, default `~/skills-hub` (override with `$SKILL_HUB_ROOT`; hub never depends on the current directory) |
+| **profile** | a named group of skills in `hub.toml`, e.g. `base`, `dingtalk` |
+| **device file** | `devices/<id>.toml` — which profiles this machine enables and into which render targets |
+| **origin** | `self` (yours, no upstream) or `vendor` (has a git upstream; a pristine copy is kept so upstream updates merge with your local patches) |
+
+Two render targets are scaffolded by default: `~/.claude/skills` (Claude Code) and `~/.agents/skills` (`agents-std` — the emerging cross-agent convention read by Codex, Cursor, opencode and others). Add more, or remove one, in `hub.toml`.
 
 ## How it works
 
 ```
  upstream sources                  the instance (git repo)                 render targets
  ─────────────────                 ───────────────────────                 ──────────────
- GitHub repo / subdir  ─install─▶  skills/<name>/     ◀── the only entities ─┬─▶ ~/.claude/skills/<name>  (symlink)
- local directory       ─adopt───▶  upstream/<name>/   ◀── pristine snapshot  ├─▶ ~/.agents/skills/<name>  (symlink)
- existing mess         ─census──▶  hub.toml           ◀── sources/profiles   ├─▶ ~/.codex/skills/<name>   (copy, optional)
-                                   devices/<id>.toml  ◀── this machine       └─▶ any agent dir you declare
+ GitHub repo / subdir  ─install─▶  skills/<name>/     ◀── the entities ────┬─▶ ~/.claude/skills/<name>  (symlink)
+ local directory       ─adopt───▶  upstream/<name>/   ◀── pristine copies  ├─▶ ~/.agents/skills/<name>  (symlink)
+ existing mess         ─census──▶  hub.toml           ◀── sources/profiles ├─▶ ~/.codex/skills/<name>   (copy, optional)
+                                   devices/<id>.toml  ◀── this machine     └─▶ any directory you declare
                                    hub.lock.json      ◀── provenance
                                             ▲  ▼
                                    git pull --rebase / push  ◀──▶  any git remote (or none)
 ```
 
-`hub sync` is the only daily verb: commit drift → pull → **materialize** (place links, clean up what hub owns) → push. `hub update` merges upstream changes into your possibly-patched copy using `upstream/` as the merge base. `hub doctor` audits the whole thing. A `SessionStart` hook surfaces pending work to the agent; `launchd` runs the safe parts unattended.
+`hub sync` is the only daily verb: commit local changes → pull → **materialize** (place links, clean up what hub owns) → push. `hub update` merges upstream changes into your possibly-patched copy using `upstream/` as the merge base. `hub doctor` audits the whole thing. A `SessionStart` hook surfaces pending work to the agent; `launchd` runs the safe parts unattended.
 
 ## Quick start
 
-**Create a new instance**
+Requirements: Python 3.11+, git, macOS or Linux (symlinks; the `launchd` automation is macOS-only — on Linux schedule the same two commands with cron/systemd).
+
+**1. Create an instance and vendor the tool into it (bootstrap)**
 
 ```bash
 git clone https://github.com/xiaolinfrank/skill-hub.git ~/repos/skill-hub
-~/repos/skill-hub/scripts/hub init                      # scaffolds ~/skills-hub (or $SKILL_HUB_ROOT)
-cd ~/skills-hub
+~/repos/skill-hub/scripts/hub init          # scaffolds ~/skills-hub (or $SKILL_HUB_ROOT)
 ~/repos/skill-hub/scripts/hub adopt ~/repos/skill-hub --name skill-hub --origin vendor \
-    --source "git+https://github.com/xiaolinfrank/skill-hub#ref=main"   # vendor the tool itself
-~/skills-hub/skills/skill-hub/scripts/hub onboard --device my-laptop   # from now on: `hub`
-hub sync
+    --source "git+https://github.com/xiaolinfrank/skill-hub#ref=main"
 ```
 
-`onboard` writes the device id to `~/.agents/device-id`, registers the lockfile merge driver in this clone, links `hub` into `~/.local/bin`, and creates `devices/my-laptop.toml` (enabling profile `base`, which already contains `skill-hub`). Add `--with-hook --with-launchd` for automation (see [The agent contract](#the-agent-contract)).
+This is the bootstrap: the clone's script builds the library, then the tool is absorbed into the library as `skills/skill-hub/` (origin `vendor`, upstream = this repo). From here on **that copy is the one you run and the one you may patch**; `~/repos/skill-hub` can be deleted. Later, `hub update skill-hub` pulls new releases and keeps your patches.
 
-**Join an existing instance from another machine**
+**2. Register this machine**
 
 ```bash
-git clone <your-instance-remote> ~/skills-hub
-~/skills-hub/skills/skill-hub/scripts/hub onboard --device my-desktop --with-hook --with-launchd
+~/skills-hub/skills/skill-hub/scripts/hub onboard --device my-laptop
+```
+
+`onboard` writes the device id to `~/.agents/device-id`, registers the lockfile merge driver in this clone, creates `devices/my-laptop.toml` (enabling profile `base`, which already contains `skill-hub`), and links `hub` into `~/.local/bin`. It does **not** edit your shell `PATH`: if `which hub` prints nothing, add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc (or pass `--no-bin` and alias it yourself). Add `--with-hook --with-launchd` for automation (see [The agent contract](#the-agent-contract)).
+
+**3. Render**
+
+```bash
 hub sync
 ```
 
-Because everything is vendored, `clone` is the whole restore. Edit `devices/my-desktop.toml` to choose profiles, `hub sync` again.
+By default this links every enabled skill into both `~/.claude/skills` and `~/.agents/skills`. Want only one? Edit `agents` in your device file.
 
-**Bring in a skill**
+**If this machine already has skills** (it probably does): the first `sync` lists every existing entry in those directories as *foreign* — that is expected and **nothing of yours is touched**. To fold them into the library, run `hub census` → `hub adopt --from-census` (see [Migrating from a messy setup](#migrating-from-a-messy-setup)); `hub sync --dry-run` previews any run.
+
+**4. Bring in a skill**
 
 ```bash
 hub install "git+https://github.com/anthropics/skills#ref=main&subdir=skills/canvas-design" --profile base
 hub sync
 ```
 
-Requirements: Python 3.11+, git. macOS or Linux (symlinks; the launchd automation is macOS-only — on Linux schedule the same commands with cron/systemd).
+`install` without `--profile` only adds the skill to the library; nothing renders until a profile or your device file's `extra` list names it. To enable something on this machine only, without touching shared profiles, add it to `extra` in `devices/my-laptop.toml`.
+
+**Join an existing instance from another machine**
+
+```bash
+git clone <your-instance-remote> ~/skills-hub
+~/skills-hub/skills/skill-hub/scripts/hub onboard --device my-desktop --with-hook --with-launchd
+hub sync                      # then edit devices/my-desktop.toml to taste, sync again
+```
+
+Because everything is vendored, `clone` is the whole restore.
 
 ## Concepts
 
@@ -118,7 +147,9 @@ Requirements: Python 3.11+, git. macOS or Linux (symlinks; the launchd automatio
 └── .gitignore
 ```
 
-Skill names must match `^[a-z0-9]+(-[a-z0-9]+)*$` (some agents enforce this). `adopt`/`install` normalize names: lower-case, `_`/`.`/space → `-`, version suffixes like `-1.0.1` stripped, the original recorded under `aliases` in the lockfile. Nested `.git` directories are never copied in.
+Skill names must match `^[a-z0-9]+(-[a-z0-9]+)*$` (some agents enforce this). `adopt` and `install` normalize names: lower-case, `_`/`.`/space → `-`, version suffixes like `-1.0.1` stripped; `adopt` records the original directory name under `aliases` in the lockfile when it differs. Nested `.git` directories are never copied in.
+
+Two names inside render targets are always left alone: `synced/` (where claude.ai places skills it syncs to your machine) and `.system` (Codex's own directory). Add others per target with `protect`.
 
 ### `hub.toml` — the manifest
 
@@ -132,12 +163,12 @@ target  = "~/.claude/skills"
 mode    = "symlink"             # symlink | copy
 protect = ["synced"]            # entries hub must never touch (synced/ and .system are always protected)
 
-[agents.agents-std]             # the emerging cross-agent convention (Codex, Cursor, opencode, …)
+[agents.agents-std]             # ~/.agents/skills: cross-agent convention (Codex, Cursor, opencode, …)
 target = "~/.agents/skills"
 mode   = "symlink"
 
-[agents.codex-legacy]           # for agents that cannot follow symlinks: rsync-style managed copies
-target  = "~/.codex/skills"
+[agents.codex-legacy]           # example: an agent that only reads its own dir or cannot follow symlinks
+target  = "~/.codex/skills"     # → managed copies instead of links; add it to a device's `agents`
 mode    = "copy"
 protect = [".system"]
 
@@ -145,8 +176,8 @@ protect = [".system"]
 base     = ["skill-hub", "crawl", "search"]
 dingtalk = ["dingtalk-*"]
 
-[skills.domain-modeling]        # only vendor-origin skills need a block; undeclared = self
-origin = "vendor"
+[skills.domain-modeling]        # vendor-origin skills get a block; undeclared skills are self
+origin = "vendor"               # documentation only — the lockfile decides (see below)
 source = "git+https://github.com/mattpocock/skills#ref=main&subdir=skills/engineering/domain-modeling"
 
 [skills.onepassword]
@@ -156,7 +187,9 @@ pin    = true                   # frozen: `update` skips it
 # agents = ["claude"]           # optional: restrict this skill to some agents (default: default_agents)
 ```
 
-hub writes to `hub.toml` in exactly two ways: `install`/`adopt` **append** a `[skills.<name>]` block (append-only text, no TOML serializer round-trip), and `install --profile P` inserts the name into the single-line array of profile `P` inside the `[profiles]` section. Everything else — reorganizing profiles, removing blocks — is a text edit by you or your agent; hub validates with `tomllib` on the next read and refuses to run (exit 2) on syntax errors.
+Which agent gets a skill: an agent listed in `default_agents` receives every enabled skill unless a `[skills.<name>]` block narrows it with `agents = [...]`. An agent **not** in `default_agents` receives only skills whose block lists it — so when you add a new render target you normally add it to `default_agents` too. If your agent reads a directory of its own or does not follow symlinks, declare a second target with `mode = "copy"` (like `codex-legacy`) and add it to the device's `agents`.
+
+hub writes to `hub.toml` in exactly two ways: `install`/`adopt` **append** a `[skills.<name>]` block (append-only text, no TOML serializer round-trip), and `install --profile P` inserts the name into the single-line array of profile `P` inside the `[profiles]` section. Everything else — reorganizing profiles, removing blocks — is a text edit by you or your agent; hub validates with `tomllib` on the next read and refuses to run (exit 2) on syntax errors. Note that `origin` in `hub.toml` is informational: the lockfile's `origin` is what `update` consults, and it is set by `install` / `adopt --origin vendor`. Hand-placing a directory into `skills/` makes it `self`.
 
 ### `devices/<id>.toml` — per-device selection
 
@@ -189,16 +222,16 @@ Each machine edits only its own file, so concurrent edits on two machines never 
       "upstream_hash": "sha256:1c0f…",
       "local_hash":    "sha256:88ae…",
       "patched": true,
-      "aliases": [],
       "vendored_at": "2026-09-05T10:12:00+08:00",
-      "updated_at":  "2026-09-05T10:12:00+08:00"
+      "updated_at":  "2026-09-12T08:00:00+08:00"
     },
+    "onepassword": { "origin": "vendor", "source": "…", "aliases": ["1password-1.0.1"], "adopted_at": "…" },
     "crawl": { "origin": "self", "local_hash": "sha256:…", "adopted_at": "…" }
   }
 }
 ```
 
-`patched` is `upstream_hash != local_hash` — you changed a vendored skill. Hashes are content hashes of the tree (symlinks hash as their target text, `.git` and `.DS_Store` ignored). `sync` refreshes `local_hash`/`patched` for every skill and drops entries for skills that no longer exist.
+`patched` is `upstream_hash != local_hash` — you changed a vendored skill. Hashes are content hashes of the tree (symlinks hash as their target text, `.git` and `.DS_Store` ignored). `sync` refreshes `local_hash`/`patched` for every skill (stamping `updated_at` when content changed) and drops entries for skills that no longer exist.
 
 Two machines both touching the lockfile would be git's classic JSON-conflict hell, so `.gitattributes` declares `hub.lock.json merge=hub-lock` and `onboard` registers the driver (`hub lock-merge %O %A %B`) in each clone: keys are unioned, same-key conflicts resolved by newer `updated_at`. Doctor check 13 verifies the driver is registered.
 
@@ -210,22 +243,31 @@ Two machines both touching the lockfile would be git's classic JSON-conflict hel
 | **vendor** | has a git source. Pristine snapshot kept; local patches survive upstream updates via 3-way merge. | yes | yes |
 | **external** | declared in a device file only; content never enters the instance. Rendered as a symlink to the absolute path. For things that must not be in any repo. | no | n/a |
 
+### Why vendor, not submodules
+
+Three reasons the library copies skills instead of nesting checkouts:
+
+1. Render targets must contain plain directories — several agents choke on nested `.git`, and doctor check 4 treats one as a defect. Vendored copies also make `git clone` a complete restore with no second step.
+2. Local patches need a stable merge base. `upstream/<name>` is that base, kept automatically; submodules make "I changed two lines of an upstream skill" a detached-HEAD chore across machines.
+3. `hub diff <name>` shows exactly what you changed against pristine upstream — ready-made PR material.
+
 ### Selection algorithm
 
 For this device: `enabled = ⋃ profiles (globs expanded over skills/) ∪ extra − disable`, validated so every name exists. For each agent in the device's `agents`: `want = {s ∈ enabled | agent ∈ (skills[s].agents or default_agents)}`. Externals are added per their own `agents` list.
 
 ## Materialization rules
 
-Materialization is the second half of `hub sync` (and the only part that touches agent directories). It is stateless for symlink mode — ownership is decided by *shape*, not by a database — and uses a small `.hub-state.json` inside copy-mode targets.
+Materialization is the second half of `hub sync` (and the only part that touches render targets). In symlink mode it is stateless — ownership is decided by *shape*, not by a database; copy-mode targets keep a small `.hub-state.json` listing the directories hub created.
 
 **Placement** (for every wanted skill, in every target):
 
 | the slot `target/<name>` currently holds | symlink mode | copy mode |
 |---|---|---|
 | nothing | create link | copy |
-| a link that already points at `skills/<name>` | keep | — |
-| a link into the instance's `skills/`, into the plugin cache, or a dead link | replace | blocked (report) |
-| **anything else** — a real directory, a file, a link to somewhere of yours | **blocked**: reported as foreign, `needs_attention`, exit 1 | same; a copy-mode directory is only refreshed if `.hub-state.json` says hub created it |
+| a link that already points at `skills/<name>` | keep | replace the link with a copy (it is ours) |
+| a link elsewhere into the instance's `skills/`, into the plugin cache, or a dead link | replace | blocked (report) |
+| a directory hub copied earlier (in `.hub-state.json`) | — | refresh if content differs |
+| **anything else** — a real directory, a file, a link to somewhere of yours | **blocked**: reported as foreign, `needs_attention`, exit 1 | same |
 
 **Cleanup** (for every entry in every target, except `protect` names, `synced/`, `.system`, `.hub-state.json`):
 
@@ -233,42 +275,47 @@ Materialization is the second half of `hub sync` (and the only part that touches
 |---|---|
 | link resolving under `~/.claude/plugins/cache/` | **remove** (rule 2 — dead or alive) |
 | link exactly of the shape hub creates (`→ skills/<name>` with the same name), skill no longer enabled | remove |
-| link to a declared external path, external no longer enabled for this agent | remove |
-| dead link that pointed into the instance | remove |
+| link to a *still-declared* external, external not enabled for this agent | remove (delete the `[[external]]` block and the link becomes foreign: kept, reported) |
+| dead link that pointed into the instance's `skills/` | remove |
 | dead link pointing anywhere else (unmounted volume, someone else's tool) | **keep**, report |
-| link into the instance but not hub-shaped (your own alias or deep link) | keep, silently |
-| link to anywhere else | keep, report as foreign |
+| link into `skills/` but not hub-shaped (your own alias or deep link) | keep, silently |
+| any other link | keep, report as foreign |
 | directory hub copied (copy mode, in `.hub-state.json`), no longer enabled | remove |
 | any other directory or file | keep, report as foreign |
 
-`--dry-run` runs the same decision tree and prints `[dry] …` for each action.
+`hub sync --dry-run` runs the same decision tree (including the content-hash check in copy mode) and prints `[dry] …` for each action it would take.
 
 ## `hub sync`
 
 ```
-0. refuse to commit/pull/push while .hub-pending/ holds an unfinished update (never spread conflict markers)
-1. adopt drift: `git add -A && git commit -m "sync(<device>): auto-commit drift"` — whoever made the change
+0. unfinished update in .hub-pending/?  → only materialize runs; commit/pull/push and the lock refresh
+   are skipped, the run exits 1 (finish with `hub update --continue`)
+1. commit drift: any uncommitted change in the instance — whoever made it — becomes
+   "sync(<device>): auto-commit drift"
 2. `git pull --rebase --autostash`  (skipped with no remote or --no-pull)
-      conflict → `git rebase --abort` (worktree stays usable), details → NEEDS_ATTENTION.md, exit 1
+      real rebase conflict → `git rebase --abort` (worktree stays usable), recorded in NEEDS_ATTENTION.md, exit 1
+      other failure (offline, auth) → warning, continue with local state, push skipped this round
 3. materialize (see above)
 4. `git push`  (skipped with no remote or --no-push; a failed push is a warning, retried next round)
-5. refresh lockfile hashes → commit "sync(<device>): refresh lock" → push; write .logs/last_sync
+5. refresh lockfile hashes → commit "sync(<device>): refresh lock" → push
+6. stamp .logs/last_sync
 ```
 
 Any `needs_attention` item raised during a sync is also appended (deduplicated) to `NEEDS_ATTENTION.md`, so unattended runs leave a trail the next session can pick up. A change you make on machine A — even by editing through the symlink inside an agent session — is committed by A's next sync and arrives at B on B's next sync. Two machines editing the same file between syncs is a rebase conflict: aborted, recorded, resolved semantically by the agent in a session. hub never force-pushes.
 
 ## Install and update (3-way merge)
 
-**Sources.** `git+<url>#ref=<branch|tag>&subdir=<path>` or a local directory. `install` does a shallow clone, takes the subdir, copies it to both `upstream/<name>` and `skills/<name>` (minus `.git`), appends the manifest block, records `upstream_commit` and hashes, and commits. The name defaults to the subdir's basename, else the repo name, else `--name`. Reinstalling an existing name is refused (exit 2) — remove `skills/<name>`, `upstream/<name>` and the manifest block first.
+**Sources.** `git+<url>#ref=<branch|tag>&subdir=<path>` or a local directory. `install` does a shallow clone, takes the subdir, copies it to both `upstream/<name>` and `skills/<name>` (minus `.git`), appends the manifest block, records `upstream_commit` and hashes, and commits just those paths. The name is `--name` if given; otherwise the subdir's basename, else the repository name (git source without subdir), else the local directory's basename — then normalized. Reinstalling a name that exists in `skills/` or as a `[skills.<name>]` block is refused (exit 2).
 
-**Freshness.** `hub update --check [--all|names]` runs `git ls-remote <url> <ref>` and compares the exact `refs/heads/<ref>` (or tag) SHA with `upstream_commit`. Entries without a recorded commit (e.g. adopted from a plain copy) are reported as `unknown_freshness`, not as updatable, so a weekly check never spams. `--write-attention` records updatable skills in `NEEDS_ATTENTION.md`.
+**Freshness.** `hub update --check` (all vendor skills, or the names given) runs `git ls-remote <url> <ref>` and compares the exact `refs/heads/<ref>` (or the peeled tag) with `upstream_commit`; local-path sources are compared by content hash. Entries without a recorded commit (e.g. adopted from a plain copy) are reported as `unknown_freshness`, not as updatable, so a weekly check never spams. `--write-attention` records updatable skills in `NEEDS_ATTENTION.md`.
 
-**Apply.** `hub update <name>` fetches the new snapshot into `.hub-pending/<name>` and merges into `skills/<name>` file by file with `base = upstream/<name>`, `ours = skills/<name>`, `theirs = pending`:
+**Apply.** `hub update <name…>` (or `--all`; names are required otherwise) fetches the new snapshot into `.hub-pending/<name>` and merges into `skills/<name>` file by file with `base = upstream/<name>`, `ours = skills/<name>`, `theirs = pending`:
 
 | situation | result |
 |---|---|
 | upstream added a file | added |
 | upstream deleted, you never touched it | deleted |
+| both sides deleted | nothing |
 | upstream deleted, you modified it | conflict |
 | you deleted, upstream modified | conflict |
 | only upstream changed | taken |
@@ -277,19 +324,19 @@ Any `needs_attention` item raised during a sync is also appended (deduplicated) 
 | both changed (binary / unmergeable) | your version kept, upstream saved as `<file>.upstream` sidecar |
 | a symlink changed on both sides | conflict (links are never text-merged and never written through) |
 
-No conflicts → `upstream/` replaced by the new snapshot, lockfile updated (`patched` recomputed), committed. Conflicts → nothing committed, the list goes to `NEEDS_ATTENTION.md`, exit 1. The agent resolves markers / sidecars and runs `hub update <name> --continue` (no name = every pending update), which refuses while any marker or sidecar remains. `pin = true` skips a skill entirely. Re-running `update` on a skill with a pending merge is refused until `--continue`.
+No conflicts → `upstream/` replaced by the new snapshot, lockfile updated (`patched` recomputed), that skill committed. Conflicts → that skill is not committed, the list goes to `NEEDS_ATTENTION.md`, exit 1; other skills in the same run are still processed and committed individually (commits are path-scoped, so conflict markers never ride along). The agent resolves markers / sidecars and runs `hub update <name> --continue` (no name = every pending update), which refuses while any marker or sidecar remains. `pin = true` skips a skill entirely. Re-running `update` on a skill with a pending merge is refused until `--continue`.
 
 Self-origin skills have no update concept: edit, `hub sync`, done.
 
 ## Adopt and census
 
-`hub census [--dirs …] [--out file]` scans agent directories (default: `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`) read-only and labels every entry:
+`hub census [--dirs …] [--out file]` scans render targets (default: `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`) read-only — it needs no instance — and labels every entry:
 
 | label | meaning | `adopt --from-census` |
 |---|---|---|
 | `entity` / `entity-versioned` | real directory (the latter with a version suffix) | adopt (name normalized) |
-| `nested-git` | real directory that is itself a git repo | adopt without `.git`; remote recorded as vendor source |
-| `external-link` | link to a directory outside the scanned dirs | adopt from the target; if it lives in a git checkout, remote + subdir recorded as vendor source |
+| `nested-git` | real directory that is itself a git repo | adopt without `.git`; remote + current branch recorded as vendor source |
+| `external-link` | link to a directory outside the scanned dirs | adopt from the target; if it lives in a git checkout, remote + branch + subdir recorded as vendor source |
 | `cross-link` | link to an entity in another scanned dir | deduplicated by real path |
 | `cache-link` | link into the plugin cache | dropped |
 | `broken` | dead link | dropped |
@@ -297,7 +344,7 @@ Self-origin skills have no update concept: edit, `hub sync`, done.
 
 Same-name candidates are compared by content hash: identical copies collapse to one (preferring the copy that carries provenance); different contents are flagged `CONFLICT` and skipped, so a human or agent decides with `hub adopt <path> --name <other>`. `--skip a,b` excludes names (e.g. ones you want as externals). Adoption persists the lockfile after every skill, so an interrupted run loses nothing.
 
-`hub adopt <path>` for a single directory auto-detects provenance: inside a git checkout with a remote → vendor (`--origin self` to override), otherwise self.
+`hub adopt <path>` for a single directory auto-detects provenance: inside a git checkout with a remote → vendor, with the checkout's current branch as `ref` (`--origin self` to override, `--source` to set the spec explicitly); otherwise self.
 
 ## Doctor
 
@@ -305,14 +352,14 @@ Same-name candidates are compared by content hash: identical copies collapse to 
 
 | # | check | `--fix` |
 |---|---|---|
-| 1 | dead links that pointed into the instance or to a declared external | remove |
+| 1 | dead links that pointed into the instance's `skills/` or to a declared external | remove |
 | 2 | links into the plugin cache | remove |
 | 3 | foreign links, dead foreign links, foreign directories | report only |
 | 4 | nested `.git` under `skills/` or `upstream/` | report |
 | 5 | non-compliant skill names | report |
 | 6 | profile patterns matching nothing (skills in no profile are listed as `library_only` info, not an issue) | report |
-| 7 | lockfile hash drift (edited but not synced) | refresh hashes + commit |
-| 8 | uncommitted / unpushed / behind remote | commit |
+| 7 | lockfile hashes stale (edited but not synced) | refresh hashes + commit |
+| 8 | uncommitted / unpushed / behind remote | commit (unless an update is pending) |
 | 9 | **old dual-clone revival**: `~/.claude/skills` or `~/.agents/skills` has become a git repo again | report (red) |
 | 12 | device id file missing; last sync older than 3 days | report |
 | 13 | lockfile merge driver not registered in this clone | report |
@@ -345,9 +392,10 @@ There is deliberately **no** "sync the worktree with Dropbox/iCloud/Syncthing" m
 
 - hub never deletes a real directory or file it did not create. Foreign entries block placement and are reported; they are not removed.
 - hub never writes through a symlink during merges; links are compared and replaced as links.
-- hub never force-pushes, never commits while a merge is pending, and aborts a conflicting rebase instead of leaving markers in the worktree.
+- hub never force-pushes. Commits made by `install`/`update` are scoped to that skill's paths, and `sync`/`doctor --fix` refuse to commit while an update is pending, so conflict markers never leave the machine.
+- A conflicting rebase is aborted, not left half-applied in the worktree.
 - Structural changes to `~/.claude` (moving or removing the skills directory itself) are for a human to run outside agent sessions; hub only manages entries inside it.
-- All destructive subcommands have `--dry-run` (`sync`) or a read-only preview (`update --check`, `census`, `doctor` without `--fix`).
+- Previews: `sync --dry-run`, `update --check`, `census`, `doctor` without `--fix`.
 - Corrupt `hub.toml` / `hub.lock.json` → exit 2 with the parser error, never a traceback.
 
 ## Dogfooding
@@ -359,9 +407,9 @@ This repository *is* a skill. An instance vendors it as `skills/skill-hub/` (`or
 The playbook that produced this tool (two same-remote clones, a symlink loop, 104 cache links, 373 entries → 224 clean skills):
 
 0. **Seal the evidence** (outside agent sessions): `tar` the directories; in each old git clone `git switch -c rescue/<dir>-<date> && git add -A && git commit && git push -u origin HEAD`. Symlinks are stored as their target text, so even broken ones commit — nothing is lost.
-1. **Census**: `hub census --out census.json`; review the `CONFLICT` groups (usually a couple of stale copies).
-2. **Build the instance**: `hub init` (or clone your instance repo and scaffold on a branch), vendor skill-hub, `hub adopt --from-census census.json --skip <externals>`, resolve conflicts with explicit `hub adopt <path>`, write profiles and `devices/<id>.toml`, `hub sync --dry-run`, commit, push.
-3. **Rewire** (outside agent sessions!): move each old directory aside (`mv ~/.claude/skills ~/.claude/skills.pre-hub`), recreate it empty, copy back protected dirs (`synced/`, `.system`), `hub onboard --with-hook --with-launchd`, `hub sync`.
+1. **Census** (read-only, no instance needed yet): `~/repos/skill-hub/scripts/hub census --out census.json`; review the `CONFLICT` groups (usually a couple of stale copies).
+2. **Build the instance**: Quick start step 1 (init + vendor skill-hub), then `hub adopt --from-census census.json --skip <names-you-want-as-externals>`, resolve conflicts with explicit `hub adopt <path>`, write profiles and `devices/<id>.toml`, `hub sync --dry-run`, commit, push.
+3. **Rewire** (outside agent sessions!): move each old directory aside (`mv ~/.claude/skills ~/.claude/skills.pre-hub`), recreate it empty, copy back the protected directories (`synced/` for Claude, `.system` for Codex — see [Instance layout](#instance-layout)), `hub onboard --with-hook --with-launchd`, `hub sync`.
 4. **Verify**: agents list the skills once (no doubled context), `hub doctor` is green, `hub status` shows the expected enabled count.
 5. After a week or two, delete the `*.pre-hub` directories. Keep the tarball and the rescue branches.
 
@@ -373,12 +421,14 @@ Second machine: seal (step 0), clone the instance, `hub census` for anything uni
 |---|---|
 | `hub init` | scaffold an instance at `$SKILL_HUB_ROOT` (default `~/skills-hub`), `git init` if needed |
 | `hub onboard [--device NAME] [--no-bin] [--with-hook] [--with-launchd]` | register this machine; idempotent |
-| `hub census [--dirs D…] [--out FILE]` | classify existing agent directories, read-only |
+| `hub census [--dirs D…] [--out FILE]` | classify existing render targets, read-only |
 | `hub adopt PATH [--name N] [--origin self\|vendor] [--source SPEC]` | absorb a directory |
 | `hub adopt --from-census FILE [--skip a,b]` | batch adoption |
 | `hub sync [--dry-run] [--no-pull] [--no-push]` | the daily verb |
 | `hub install SPEC [--name N] [--profile P] [--no-git]` | vendor from `git+URL#ref=…&subdir=…` or a local path |
-| `hub update [NAME…] [--all] [--check] [--continue] [--no-git] [--write-attention]` | freshness check / 3-way merge / finalize |
+| `hub update NAME… \| --all [--no-git]` | 3-way merge upstream changes (names or `--all` required) |
+| `hub update --check [NAME…] [--write-attention]` | freshness check (all vendor skills by default) |
+| `hub update [NAME…] --continue` | finalize after resolving conflicts (all pending by default) |
 | `hub doctor [--fix] [--write-attention]` | health checks |
 | `hub status` | device, enabled count, patched skills, git state, last sync |
 | `hub diff NAME` | `diff -ru upstream/NAME skills/NAME` (in `data.diff` with `--json`) |
@@ -389,7 +439,7 @@ Environment: `SKILL_HUB_ROOT` (instance path), `SKILL_HUB_DEVICE_FILE` (default 
 
 ## Limitations and roadmap
 
-- No `uninstall` yet: delete `skills/<name>`, `upstream/<name>` and the `[skills.<name>]` block; the next `sync` drops the lock entry and removes the links.
+- No `uninstall` yet: delete `skills/<name>`, `upstream/<name>`, the `[skills.<name>]` block, and the name from any `[profiles]` array or device `extra` list; the next `sync` drops the lock entry and removes the links.
 - `update` has no `--dry-run`/`--abort`; preview with `--check` and `hub diff`, revert with git.
 - Source types are `git+…` and local paths; installer registries (ClawHub-style) are planned.
 - Doctor checks 10 and 11 are reserved (see table).

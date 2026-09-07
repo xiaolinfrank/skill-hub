@@ -121,6 +121,25 @@ def has_remote(cwd=None):
                cwd=cwd or HUB_ROOT, check=False).returncode == 0
 
 
+def pending_updates():
+    """Names with an unfinished `hub update` (snapshot parked in .hub-pending/)."""
+    d = p(".hub-pending")
+    if not os.path.isdir(d):
+        return []
+    return sorted(x for x in os.listdir(d) if os.path.isdir(os.path.join(d, x)))
+
+
+def git_commit_paths(paths, msg):
+    """Stage and commit ONLY the given paths — never `add -A`, so an unfinished
+    update elsewhere in skills/ can never ride along in an unrelated commit."""
+    git(["add", "--"] + paths, check=False)
+    if run(["git", "diff", "--cached", "--quiet"], cwd=HUB_ROOT,
+           check=False).returncode != 0:
+        git(["commit", "--quiet", "-m", msg])
+        return True
+    return False
+
+
 def tree_hash(path):
     """Stable content hash of a directory tree (symlinks hashed as targets)."""
     h = hashlib.sha256()
@@ -473,12 +492,15 @@ def _install_launchd(rep):
 
 
 def _git_top_and_remote(path):
+    """(toplevel, origin url, current branch) for a path inside a checkout."""
     r = run(["git", "-C", path, "rev-parse", "--show-toplevel"], check=False)
     if r.returncode != 0:
-        return None, None
+        return None, None, None
     top = r.stdout.strip()
     rr = run(["git", "-C", top, "remote", "get-url", "origin"], check=False)
-    return top, (rr.stdout.strip() if rr.returncode == 0 else None)
+    rb = run(["git", "-C", top, "symbolic-ref", "--short", "HEAD"], check=False)
+    branch = rb.stdout.strip() if rb.returncode == 0 and rb.stdout.strip() else "main"
+    return top, (rr.stdout.strip() if rr.returncode == 0 else None), branch
 
 
 def cmd_census(args, rep):
@@ -511,16 +533,18 @@ def cmd_census(args, rep):
                     row["label"] = "hub-managed"
                 else:
                     row["label"] = "external-link"
-                    top, remote = _git_top_and_remote(real)
+                    top, remote, branch = _git_top_and_remote(real)
                     if top:
                         row["git_top"] = top
                         row["git_remote"] = remote
+                        row["git_branch"] = branch
                         row["subdir"] = os.path.relpath(real, top)
             elif os.path.isdir(fp):
                 if os.path.isdir(os.path.join(fp, ".git")):
                     row["label"] = "nested-git"
-                    top, remote = _git_top_and_remote(fp)
+                    top, remote, branch = _git_top_and_remote(fp)
                     row["git_remote"] = remote
+                    row["git_branch"] = branch
                 elif VERSION_SUFFIX_RE.match(name):
                     row["label"] = "entity-versioned"
                 else:
@@ -643,7 +667,7 @@ def cmd_adopt(args, rep):
             name = row["suggested_name"]
             remote = row.get("git_remote")
             if remote:
-                spec = f"git+{remote}#ref=main"
+                spec = f"git+{remote}#ref={row.get('git_branch') or 'main'}"
                 if row.get("subdir") and row["subdir"] != ".":
                     spec += f"&subdir={row['subdir']}"
                 origin, source_spec = "vendor", spec
@@ -674,10 +698,10 @@ def cmd_adopt(args, rep):
         origin = args.origin
         source_spec = args.source
         if origin in (None, "vendor") and not source_spec:
-            top, remote = _git_top_and_remote(src)
+            top, remote, branch = _git_top_and_remote(src)
             if remote:
                 sub = os.path.relpath(src, top)
-                source_spec = f"git+{remote}#ref=main" + (
+                source_spec = f"git+{remote}#ref={branch}" + (
                     f"&subdir={sub}" if sub != "." else "")
                 if origin is None:
                     origin = "vendor"   # auto-detected provenance
@@ -772,20 +796,28 @@ def materialize(manifest, dev, rep, dry=False):
                 _place_link(dst, src, agent, s, "managed link", rep, foreign,
                             dry, hub_skills_real)
             else:  # copy
-                if os.path.islink(dst) or (os.path.exists(dst)
-                                           and s not in state["managed"]):
+                if os.path.islink(dst) and os.path.realpath(dst).startswith(
+                        hub_skills_real + os.sep):
+                    if dry:                     # our own link from symlink days
+                        rep.act(f"[dry] replace hub link with copy {agent}:{s}")
+                        continue
+                    os.remove(dst)
+                elif os.path.islink(dst) or (os.path.exists(dst)
+                                             and s not in state["managed"]):
                     what = ("link" if os.path.islink(dst) else
                             "entity" if os.path.isdir(dst) else "file")
                     foreign.append((agent, dst, f"foreign {what} blocks copy"))
                     rep.attention(f"{agent}:{s} enabled but blocked by a "
                                   f"foreign {what} — resolve manually")
                     continue
-                if dry:
-                    rep.act(f"[dry] copy {agent}:{s}")
-                    continue
                 try:
-                    if not os.path.exists(dst) or \
-                            tree_hash(dst) != tree_hash(src):
+                    needs_copy = not os.path.exists(dst) or \
+                        tree_hash(dst) != tree_hash(src)
+                    if dry:
+                        if needs_copy:
+                            rep.act(f"[dry] copy {agent}:{s}")
+                        continue
+                    if needs_copy:
                         copy_tree(src, dst)
                         rep.act(f"copy {agent}:{s}")
                 except OSError as e:
@@ -876,10 +908,7 @@ def cmd_sync(args, rep):
     dev = load_device(did)
     rep.data["device"] = did
     dry = args.dry_run
-    pend = []
-    if os.path.isdir(p(".hub-pending")):
-        pend = sorted(x for x in os.listdir(p(".hub-pending"))
-                      if os.path.isdir(p(".hub-pending", x)))
+    pend = pending_updates()
     if pend:
         rep.attention("unresolved update conflict(s): " + ", ".join(pend) +
                       " — run `hub update <name> --continue` first; "
@@ -902,15 +931,24 @@ def cmd_sync(args, rep):
         r = run(["git", "pull", "--rebase", "--autostash", "--quiet"],
                 cwd=HUB_ROOT, check=False)
         if r.returncode != 0:
-            run(["git", "rebase", "--abort"], cwd=HUB_ROOT, check=False)
-            needs_attention_write(
-                f"sync({did}): rebase conflict",
-                ["`git pull --rebase` hit conflicts and was aborted (worktree "
-                 "restored).", "Resolve in a session: pull, merge semantically, "
-                 "then `hub sync`.", f"git said: {r.stderr.strip()[:400]}"])
-            rep.attention("rebase conflict — aborted, details in NEEDS_ATTENTION.md")
-            return
-        rep.act("pulled (rebase)")
+            in_rebase = any(os.path.isdir(p(".git", d))
+                            for d in ("rebase-merge", "rebase-apply"))
+            if in_rebase:                       # a real conflict
+                run(["git", "rebase", "--abort"], cwd=HUB_ROOT, check=False)
+                needs_attention_write(
+                    f"sync({did}): rebase conflict",
+                    ["`git pull --rebase` hit conflicts and was aborted "
+                     "(worktree restored).",
+                     "Resolve in a session: `git pull --rebase`, merge "
+                     "semantically, then `hub sync`."])
+                rep.attention("rebase conflict — aborted, details in "
+                              "NEEDS_ATTENTION.md")
+                return
+            rep.warn("pull failed (offline or remote unreachable?) — "
+                     "continuing with local state; push skipped this round")
+            args.no_push = True
+        else:
+            rep.act("pulled (rebase)")
     # 3) materialize
     materialize(manifest, dev, rep, dry=dry)
     # 4) push
@@ -947,6 +985,7 @@ def cmd_sync(args, rep):
                 git(["commit", "--quiet", "-m", f"sync({did}): refresh lock"])
                 if has_remote() and not args.no_push:
                     run(["git", "push", "--quiet"], cwd=HUB_ROOT, check=False)
+    if not dry:
         os.makedirs(p(".logs"), exist_ok=True)
         with open(p(".logs", "last_sync"), "w") as fh:
             fh.write(now_iso() + "\n")
@@ -1003,9 +1042,9 @@ def cmd_install(args, rep):
     if args.profile:
         _add_to_profile(name, args.profile, rep)
     if not args.no_git:
-        git(["add", "-A"])
-        git(["commit", "--quiet", "-m",
-             f"hub: install {name} ({spec}" + (f"@{commit[:9]}" if commit else "") + ")"])
+        git_commit_paths(
+            [f"skills/{name}", f"upstream/{name}", "hub.lock.json", "hub.toml"],
+            f"hub: install {name} ({spec}" + (f"@{commit[:9]}" if commit else "") + ")")
         rep.act("committed")
     rep.act(f"installed {name}; enable it in a profile/device then `hub sync`")
     rep.data["name"] = name
@@ -1080,6 +1119,8 @@ def _merge_trees(base, ours, theirs, rep, name):
     for rel in sorted(fb | fo | ft):
         b, o, t = (read(base, rel), read(ours, rel), read(theirs, rel))
         dst = os.path.join(ours, rel)
+        if o is None and t is None:                              # both deleted
+            continue
         if t is not None and o is None and b is None:            # upstream added
             place(theirs, rel, dst)
         elif t is None and b is not None and o == b:             # upstream deleted, ours untouched
@@ -1124,13 +1165,16 @@ def _merge_trees(base, ours, theirs, rep, name):
 def cmd_update(args, rep):
     manifest = load_manifest()
     lock = load_lock()
-    targets = args.names or []
-    if args.all or not targets:
-        targets = [n for n, e in lock["skills"].items()
-                   if e.get("origin") == "vendor"]
     if args.cont:
         _update_continue(args, rep, lock)
         return
+    targets = list(args.names or [])
+    if not targets:
+        if not (args.all or args.check):
+            rep.fail("pass skill names, or --all to update every vendor skill", 2)
+            return
+        targets = [n for n, e in lock["skills"].items()
+                   if e.get("origin") == "vendor"]
     updates, skipped = [], []
     for name in targets:
         e = lock["skills"].get(name)
@@ -1146,7 +1190,12 @@ def cmd_update(args, rep):
         if not src:
             skipped.append(f"{name} (no parsable source)")
             continue
-        if src["type"] == "git":
+        if src["type"] == "local":
+            path = src.get("path", "")
+            if os.path.isdir(path) and e.get("upstream_hash") and \
+                    tree_hash(path) == e["upstream_hash"]:
+                continue                      # local source unchanged
+        elif src["type"] == "git":
             ref = src.get("ref", "main")
             if not e.get("upstream_commit"):
                 rep.data.setdefault("unknown_freshness", []).append(name)
@@ -1157,13 +1206,14 @@ def cmd_update(args, rep):
                 if r.returncode != 0:
                     rep.warn(f"{name}: ls-remote failed")
                     continue
-                head = None
+                refs = {}
                 for line in r.stdout.splitlines():
                     parts = line.split()
-                    if len(parts) == 2 and parts[1] in (
-                            f"refs/heads/{ref}", f"refs/tags/{ref}", ref):
-                        head = parts[0]
-                        break
+                    if len(parts) == 2:
+                        refs[parts[1]] = parts[0]
+                head = (refs.get(f"refs/tags/{ref}^{{}}")   # peeled annotated tag
+                        or refs.get(f"refs/heads/{ref}")
+                        or refs.get(f"refs/tags/{ref}") or refs.get(ref))
                 if head is None:
                     rep.warn(f"{name}: ref '{ref}' not found on remote — skipped")
                     continue
@@ -1215,10 +1265,10 @@ def cmd_update(args, rep):
         e["updated_at"] = now_iso()
         save_lock(lock)
         if not args.no_git:
-            git(["add", "-A"])
-            git(["commit", "--quiet", "-m",
-                 f"hub: update {name} ({old + '..' if commit and old else ''}"
-                 f"{commit[:9] if commit else 'local'})"])
+            git_commit_paths(
+                [f"skills/{name}", f"upstream/{name}", "hub.lock.json", "hub.toml"],
+                f"hub: update {name} ({old + '..' if commit and old else ''}"
+                f"{commit[:9] if commit else 'local'})")
         rep.act(f"updated {name}" + (" (local patches preserved)" if e["patched"] else ""))
 
 
@@ -1270,9 +1320,9 @@ def _update_continue(args, rep, lock):
         e["updated_at"] = now_iso()
         save_lock(lock)
         if not args.no_git:
-            git(["add", "-A"])
-            git(["commit", "--quiet", "-m",
-                 f"hub: update {name} (conflicts resolved)"])
+            git_commit_paths(
+                [f"skills/{name}", f"upstream/{name}", "hub.lock.json", "hub.toml"],
+                f"hub: update {name} (conflicts resolved)")
         rep.act(f"update of {name} finalized")
 
 
@@ -1429,7 +1479,10 @@ def cmd_doctor(args, rep):
             rep.act("fixed: refreshed lock hashes")
         if any(i["check"] in (7, 8) for i in issues):
             st = git(["status", "--porcelain"]).stdout.strip()
-            if st:
+            if st and pending_updates():
+                rep.warn("unfinished update(s) present — not committing drift; "
+                         "finish them with `hub update --continue` first")
+            elif st:
                 git(["add", "-A"])
                 git(["commit", "--quiet", "-m", "hub: doctor --fix commit drift"])
                 for i in issues:
