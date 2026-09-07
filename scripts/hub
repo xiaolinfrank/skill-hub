@@ -451,6 +451,10 @@ def _install_launchd(rep):
     <string>{hub_bin}</string>{''.join(f'<string>{a}</string>' for a in sub)}
   </array>
   <key>StartCalendarInterval</key><dict>{cal_xml}</dict>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>{os.path.dirname(sys.executable)}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>{os.path.expanduser('~')}</string>
+  </dict>
   <key>StandardOutPath</key><string>{logs}/{label}.log</string>
   <key>StandardErrorPath</key><string>{logs}/{label}.log</string>
 </dict></plist>
@@ -1363,10 +1367,8 @@ def cmd_doctor(args, rep):
             referenced.update(hits)
             if not hits:
                 issue(6, f"profile '{prof}' pattern '{pat}' matches nothing")
-    orphan = names - referenced - {"skill-hub"}
-    if orphan:
-        issue(6, f"{len(orphan)} skill(s) in no profile: "
-              + ", ".join(sorted(orphan)[:10]) + ("…" if len(orphan) > 10 else ""))
+    # skills in no profile are the library's shelf, not a problem — report as info
+    rep.data["library_only"] = sorted(names - referenced - {"skill-hub"})
     # 7 lock drift
     for name in names:
         e = lock["skills"].get(name)
