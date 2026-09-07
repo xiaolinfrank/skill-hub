@@ -7,7 +7,7 @@ HUB_ROOT="${SKILL_HUB_ROOT:-$HOME/skills-hub}"
 if [ -f "$HUB_ROOT/NEEDS_ATTENTION.md" ]; then
   n=$(grep -c '^## ' "$HUB_ROOT/NEEDS_ATTENTION.md" 2>/dev/null || true)
   if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
-    echo "skill-hub: $n pending section(s) in NEEDS_ATTENTION.md — say 「处理 hub 待办」 to handle them."
+    echo "skill-hub: $n pending section(s) in NEEDS_ATTENTION.md — ask your agent to 'handle the hub backlog' (处理 hub 待办)."
   else
     echo "skill-hub: NEEDS_ATTENTION.md is empty — delete it to clear this notice."
   fi

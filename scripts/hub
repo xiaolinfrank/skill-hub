@@ -432,10 +432,12 @@ def _install_launchd(rep):
     hub_bin = os.path.realpath(__file__)
     logs = p(".logs")
     os.makedirs(logs, exist_ok=True)
+    weekly = (f"'{hub_bin}' update --check --all --write-attention; "
+              f"'{hub_bin}' doctor --write-attention")
     jobs = {
-        "com.skillhub.sync": (["sync"], {"Hour": 9, "Minute": 30}),
-        "com.skillhub.weekly": (
-            ["doctor", "--write-attention"], {"Weekday": 1, "Hour": 10, "Minute": 0}),
+        "com.skillhub.sync": ([hub_bin, "sync"], {"Hour": 9, "Minute": 30}),
+        "com.skillhub.weekly": (["/bin/sh", "-c", weekly],
+                                {"Weekday": 1, "Hour": 10, "Minute": 0}),
     }
     la = os.path.expanduser("~/Library/LaunchAgents")
     os.makedirs(la, exist_ok=True)
@@ -448,7 +450,7 @@ def _install_launchd(rep):
 <plist version="1.0"><dict>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key><array>
-    <string>{hub_bin}</string>{''.join(f'<string>{a}</string>' for a in sub)}
+    {''.join(f'<string>{a}</string>' for a in sub)}
   </array>
   <key>StartCalendarInterval</key><dict>{cal_xml}</dict>
   <key>EnvironmentVariables</key><dict>
@@ -816,7 +818,7 @@ def materialize(manifest, dev, rep, dry=False):
                         is_ext = bool(ext_tgt) and \
                             real == os.path.realpath(ext_tgt)
                         if is_cache_path(fp):
-                            _rm(fp, dry, rep, f"cache-link {agent}:{entry} (铁律2)")
+                            _rm(fp, dry, rep, f"cache-link {agent}:{entry} (rule 2: never link into plugin cache)")
                         elif is_ext:
                             if entry not in ext_want:
                                 _rm(fp, dry, rep,
