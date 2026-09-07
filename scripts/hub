@@ -386,7 +386,7 @@ def cmd_onboard(args, rep):
                      f'disable  = []\n')
         rep.act(f"created devices/{did}.toml (edit to taste)")
     # merge driver must be registered per-clone (doctor check #13)
-    hub_bin = os.path.abspath(__file__)
+    hub_bin = os.path.realpath(__file__)
     git(["config", "merge.hub-lock.driver", f"{hub_bin} lock-merge %O %A %B"])
     rep.act("registered hub-lock merge driver in .git/config")
     if not args.no_bin:
@@ -408,7 +408,7 @@ def cmd_onboard(args, rep):
 
 def _install_hook(rep):
     settings_fp = os.path.expanduser("~/.claude/settings.json")
-    guard = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guard")
+    guard = os.path.join(os.path.dirname(os.path.realpath(__file__)), "guard")
     settings = {}
     if os.path.exists(settings_fp):
         try:
@@ -429,7 +429,7 @@ def _install_hook(rep):
 
 
 def _install_launchd(rep):
-    hub_bin = os.path.abspath(__file__)
+    hub_bin = os.path.realpath(__file__)
     logs = p(".logs")
     os.makedirs(logs, exist_ok=True)
     jobs = {
@@ -1715,7 +1715,7 @@ def cmd_selftest(args, rep):
             json.dump({"schema": 1, "skills": {}}, open(fb, "w"))
             json.dump(lo, open(fo, "w"))
             json.dump(lt, open(ft, "w"))
-            r9 = run([os.path.abspath(__file__), "lock-merge", fb, fo, ft],
+            r9 = run([os.path.realpath(__file__), "lock-merge", fb, fo, ft],
                      check=False)
             got = json.load(open(fo))
             check(r9.returncode == 0 and set(got["skills"]) == {"a", "b"},
