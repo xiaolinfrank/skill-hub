@@ -23,9 +23,9 @@ description: >
 - Device identity comes from `~/.agents/device-id` (written by `hub onboard`).
 - Iron rules: entities exist only inside the library; never touch `synced/`
   or `.system`; never symlink anything under `plugins/cache`; structural
-  changes to `~/.claude` (moving/removing the directory itself) are done
-  OUTSIDE agent sessions via a generated script the user runs; never force
-  push the hub repo.
+  changes to `~/.claude` (moving/removing the directory itself) are never done
+  inline — generate a script and let the user run it (other sessions need not
+  be stopped: skills hot-reload); never force push the hub repo.
 
 ## 1. Intent → command map
 

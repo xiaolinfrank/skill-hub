@@ -396,7 +396,7 @@ There is deliberately **no** "sync the worktree with Dropbox/iCloud/Syncthing" m
 - hub never writes through a symlink during merges; links are compared and replaced as links.
 - hub never force-pushes. Commits made by `install`/`update` are scoped to that skill's paths, and `sync`/`doctor --fix` refuse to commit while an update is pending, so conflict markers never leave the machine.
 - A conflicting rebase is aborted, not left half-applied in the worktree.
-- Structural changes to `~/.claude` (moving or removing the skills directory itself) are for a human to run outside agent sessions; hub only manages entries inside it.
+- Structural changes to `~/.claude` (moving or removing the skills directory itself) are for a human to run, not for an agent to do inline; hub only manages entries inside it. Other sessions need not be stopped: agents hot-reload the skills directory, and a same-filesystem `mv` keeps running scripts alive on their open handles.
 - Previews: `sync --dry-run`, `update --check`, `census`, `doctor` without `--fix`.
 - Corrupt `hub.toml` / `hub.lock.json` → exit 2 with the parser error, never a traceback.
 
@@ -411,7 +411,7 @@ The playbook that produced this tool (two same-remote clones, a symlink loop, 10
 0. **Seal the evidence** (outside agent sessions): `tar` the directories; in each old git clone `git switch -c rescue/<dir>-<date> && git add -A && git commit && git push -u origin HEAD`. Symlinks are stored as their target text, so even broken ones commit — nothing is lost.
 1. **Census** (read-only, no instance needed yet): `~/repos/skill-hub/scripts/hub census --out census.json`; review the `CONFLICT` groups (usually a couple of stale copies).
 2. **Build the instance**: Quick start step 1 (init + vendor skill-hub), then `hub adopt --from-census census.json --skip <names-you-want-as-externals>`, resolve conflicts with explicit `hub adopt <path>`, write profiles and `devices/<id>.toml`, `hub sync --dry-run`, commit, push.
-3. **Rewire** (outside agent sessions!): move each old directory aside (`mv ~/.claude/skills ~/.claude/skills.pre-hub`), recreate it empty, copy back the protected directories (`synced/` for Claude, `.system` for Codex — see [Instance layout](#instance-layout)), `hub onboard --with-hook --with-launchd`, `hub sync`.
+3. **Rewire** (you run this, not the agent): clone and `hub onboard --with-hook --with-launchd` first, then move each old directory aside (`mv ~/.claude/skills ~/.claude/skills.pre-hub`), recreate it empty, copy back the protected directories (`synced/` for Claude, `.system` for Codex — see [Instance layout](#instance-layout)), `hub sync`. Doing the clone and onboard before the move keeps the window where skills are missing down to the sync itself.
 4. **Verify**: agents list the skills once (no doubled context), `hub doctor` is green, `hub status` shows the expected enabled count.
 5. After a week or two, delete the `*.pre-hub` directories. Keep the tarball and the rescue branches.
 
