@@ -15,6 +15,7 @@ needs_attention, data}.
 """
 
 import argparse
+import atexit
 import datetime
 import fnmatch
 import hashlib
@@ -316,16 +317,93 @@ def source_to_spec(src):
     return json.dumps(src)
 
 
-def fetch_upstream(src, tmp):
-    """Fetch upstream skill content into tmp/<content>. Returns (dir, commit)."""
+_CLONE_TMP = None       # process-lifetime scratch dir holding cached clones
+_CLONES = {}            # (url, ref) -> {"path", "sparse", "dirs"}
+
+
+def _clone_root():
+    global _CLONE_TMP
+    if _CLONE_TMP is None:
+        _CLONE_TMP = tempfile.TemporaryDirectory(prefix="hub-clone-")
+        atexit.register(_CLONE_TMP.cleanup)
+    return _CLONE_TMP.name
+
+
+def _clone_cached(url, ref):
+    """One shallow clone per (url, ref) per run, reused across skills.
+
+    Blobless + sparse where the server supports it, so N skills vendored from
+    one big monorepo cost one small fetch instead of N full clones. Falls back
+    to a plain shallow clone when the server refuses partial clone.
+    """
+    key = (url, ref)
+    if key in _CLONES:
+        return _CLONES[key]
+    dest = os.path.join(_clone_root(),
+                        hashlib.sha256(f"{url}\n{ref}".encode()).hexdigest()[:16])
+    shutil.rmtree(dest, ignore_errors=True)
+    common = ["--quiet", "--depth", "1", "--branch", ref]
+    r = run(["git", "clone"] + common + ["--filter=blob:none", "--sparse",
+                                         url, dest], check=False)
+    sparse = r.returncode == 0
+    if not sparse:                      # old git, or server without partial clone
+        shutil.rmtree(dest, ignore_errors=True)
+        run(["git", "clone"] + common + [url, dest])
+    else:
+        run(["git", "-C", dest, "sparse-checkout", "init", "--cone"], check=False)
+    entry = {"path": dest, "sparse": sparse, "dirs": set()}
+    _CLONES[key] = entry
+    return entry
+
+
+def _clone_cache_reset():
+    """The cache spans one command, not one process: selftest (and any future
+    in-process caller) dispatches several commands, and a second `update` must
+    see upstream commits made since the first one."""
+    for entry in _CLONES.values():
+        shutil.rmtree(entry["path"], ignore_errors=True)
+    _CLONES.clear()
+
+
+def _clone_unsparse(entry):
+    """Materialize the whole tree (costs a blob fetch on a blobless clone)."""
+    if entry["sparse"]:
+        run(["git", "-C", entry["path"], "sparse-checkout", "disable"], check=False)
+        entry["sparse"] = False
+
+
+def _clone_want(entry, subdir):
+    """Add subdir to the clone's sparse set, keeping what earlier skills asked for."""
+    if not entry["sparse"]:
+        return
+    want = entry["dirs"] | {subdir}
+    if want == entry["dirs"]:
+        return
+    r = run(["git", "-C", entry["path"], "sparse-checkout", "set"] + sorted(want),
+            check=False)
+    if r.returncode != 0:               # pattern cone mode will not take
+        _clone_unsparse(entry)
+        return
+    entry["dirs"] = want
+
+
+def fetch_upstream(src, tmp=None):
+    """Return (content dir, commit) for a source.
+
+    `tmp` is accepted for backwards compatibility; git sources now come from
+    the per-run clone cache instead, which is cleaned up at process exit.
+    """
     if src["type"] == "git":
-        clone = os.path.join(tmp, "clone")
-        run(["git", "clone", "--quiet", "--depth", "1",
-             "--branch", src.get("ref", "main"), src["url"], clone])
-        commit = run(["git", "rev-parse", "HEAD"], cwd=clone).stdout.strip()
-        content = os.path.join(clone, src.get("subdir", "")) if src.get("subdir") else clone
+        entry = _clone_cached(src["url"], src.get("ref", "main"))
+        commit = run(["git", "rev-parse", "HEAD"], cwd=entry["path"]).stdout.strip()
+        subdir = src.get("subdir", "").strip("/")
+        if not subdir:
+            _clone_unsparse(entry)
+            return entry["path"], commit
+        _clone_want(entry, subdir)
+        content = os.path.join(entry["path"], subdir)
         if not os.path.isdir(content):
-            raise FileNotFoundError(f"subdir '{src.get('subdir')}' not in {src['url']}")
+            raise FileNotFoundError(f"subdir '{subdir}' not in {src['url']}")
         return content, commit
     if src["type"] == "local":
         if not os.path.isdir(src["path"]):
@@ -1850,6 +1928,7 @@ DISPATCH = {
 
 
 def _dispatch(args, rep):
+    _clone_cache_reset()
     try:
         DISPATCH[args.cmd](args, rep)
     except (OSError, tomllib.TOMLDecodeError, json.JSONDecodeError) as e:
