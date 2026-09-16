@@ -1128,26 +1128,118 @@ def cmd_install(args, rep):
     rep.data["name"] = name
 
 
+def _array_span(text, profile, start, end):
+    """Span of `profile = [ … ]` declared between start and end.
+
+    Only the `profile = [` declaration has to start inside [start, end); the
+    scan for the closing bracket is deliberately unbounded, so an array is
+    read whole however it is laid out. The bracket is found by scanning
+    rather than by regex, so a `]` inside a string or a comment cannot end
+    the array early.
+    """
+    key = re.compile(rf'^[ \t]*{re.escape(profile)}[ \t]*=[ \t]*\[', re.MULTILINE)
+    m = key.search(text, start, end)
+    if not m:
+        return None
+    i = text.rindex("[", m.start(), m.end())
+    j, quote, esc = i + 1, None, False
+    while j < len(text):
+        ch = text[j]
+        if quote:
+            if esc:
+                esc = False
+            elif ch == "\\" and quote == '"':     # only basic strings escape
+                esc = True
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":                           # comment runs to end of line
+            nl = text.find("\n", j)
+            j = len(text) if nl < 0 else nl
+            continue
+        elif ch == "]":
+            return i, j
+        j += 1
+    return None
+
+
+def _array_has(body, name):
+    """True if the array body already lists this name as a live item.
+
+    Comments are stripped first: a commented-out entry is how people park a
+    skill they have disabled, and reading it as present would make
+    `install --profile` silently do nothing.
+    """
+    code = "\n".join(_split_comment(line)[0] for line in body.split("\n"))
+    return re.search(rf'(?<![^\s,\[]){re.escape(chr(34) + name + chr(34))}|'
+                     rf'{re.escape(chr(39) + name + chr(39))}', code) is not None
+
+
+def _split_comment(line):
+    """(code, comment) for one array line; `#` inside a string is not a comment."""
+    quote, esc = None, False
+    for k, ch in enumerate(line):
+        if quote:
+            if esc:
+                esc = False
+            elif ch == "\\" and quote == '"':
+                esc = True
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            return line[:k], line[k:]
+    return line, ""
+
+
+def _array_insert(body, name):
+    """Add name to an array body, keeping the style it is already written in.
+
+    The new item goes directly after the last existing item, so trailing
+    comment lines stay at the bottom and a comment is never mistaken for an
+    item that needs a comma.
+    """
+    if "\n" not in body:                          # single line: a = ["x", "y"]
+        inner = body.strip()
+        return (inner + ", " if inner else "") + f'"{name}"'
+    lines = body.split("\n")
+    last = None                                   # index of the last item line
+    for k in range(len(lines) - 1, -1, -1):
+        if _split_comment(lines[k])[0].strip():
+            last = k
+            break
+    if last is None:                              # only blanks/comments so far
+        return f'\n  "{name}",{body}'
+    code, comment = _split_comment(lines[last])
+    if not code.rstrip().endswith(","):           # comma goes on the item, not the comment
+        pad = code[len(code.rstrip()):]
+        lines[last] = code.rstrip() + "," + pad + comment
+    indent = code[:len(code) - len(code.lstrip())] or "  "
+    lines.insert(last + 1, f'{indent}"{name}",')
+    return "\n".join(lines)
+
+
 def _add_to_profile(name, profile, rep):
-    """Text surgery: append name to an existing single-line profile array."""
+    """Text surgery: add name to a profile array, single-line or multi-line."""
     fp = p("hub.toml")
     text = open(fp).read()
-    pat = re.compile(rf'^({re.escape(profile)}\s*=\s*\[)(.*?)(\])',
-                     re.MULTILINE)
     sec = re.search(r"(?ms)^\[profiles\]\s*$.*?(?=^\[|\Z)", text)
     if not sec:
         rep.warn(f"[profiles] section not found — add \"{name}\" manually")
         return
-    m = pat.search(text, sec.start(), sec.end())
-    if not m:
-        rep.warn(f"profile '{profile}' not found as single-line array in "
-                 f"[profiles] — add \"{name}\" to it manually")
+    span = _array_span(text, profile, sec.start(), sec.end())
+    if not span:
+        rep.warn(f"profile '{profile}' not found as an array in [profiles] — "
+                 f"add \"{name}\" to it manually")
         return
-    inner = m.group(2).strip()
-    if f'"{name}"' in inner:
+    i, j = span
+    body = text[i + 1:j]
+    if _array_has(body, name):
+        rep.act(f"{name} already in profile '{profile}'")
         return
-    new_inner = (inner + ", " if inner else "") + f'"{name}"'
-    text = text[:m.start()] + m.group(1) + new_inner + m.group(3) + text[m.end():]
+    text = text[:i + 1] + _array_insert(body, name) + text[j:]
     with open(fp, "w") as fh:
         fh.write(text)
     rep.act(f"added {name} to profile '{profile}'")
@@ -1723,6 +1815,77 @@ def cmd_selftest(args, rep):
             check(os.path.exists(p("upstream", "demo", "SKILL.md")),
                   "install writes pristine upstream")
             check('"demo"' in open(p("hub.toml")).read(), "install appends manifest+profile")
+            # ---- profile array editing, against a manifest full of decoys ----
+            fp = p("hub.toml")
+            saved = open(fp).read()
+
+            def profile_edit(manifest, add, profile="base"):
+                """Run _add_to_profile on a fixture; return (text, parsed, report)."""
+                open(fp, "w").write(manifest)
+                r = Report("fixture")
+                _add_to_profile(add, profile, r)
+                out = open(fp).read()
+                try:
+                    return out, tomllib.loads(out), r
+                except tomllib.TOMLDecodeError:
+                    return out, None, r
+
+            # every decoy here is something the real regex has to refuse
+            decoys = (
+                "[skills.decoy]\n"          # before [profiles]: only the bounds exclude it
+                'base = ["outside-the-profiles-section"]\n'
+                "\n"
+                "[profiles]\n"
+                '# base = ["commented-out-declaration"]\n'
+                'base-extra = ["other-profile"]\n'
+                "base = [\n"
+                '  "keep-me",\n'
+                '  # "parked",   # disabled for now\n'
+                "]\n"
+            )
+            out, conf, _r = profile_edit(decoys, "added-one")
+            check(bool(conf) and conf["profiles"]["base"] == ["keep-me", "added-one"]
+                  and conf["profiles"]["base-extra"] == ["other-profile"]
+                  and conf["skills"]["decoy"]["base"] == ["outside-the-profiles-section"]
+                  and '# base = ["commented-out-declaration"]' in out,
+                  f"profile edit hits the right array, not the decoys "
+                  f"(got {conf['profiles'] if conf else 'unparseable'})")
+            check('\n  "added-one",\n' in out and '  # "parked",   # disabled for now\n' in out,
+                  "multi-line insert keeps one item per line and preserves comments")
+
+            # a commented-out entry is not a member: re-adding it must work
+            _out2, conf2, _r2 = profile_edit(decoys, "parked")
+            check(bool(conf2) and conf2["profiles"]["base"] == ["keep-me", "parked"],
+                  f"commented-out name is not read as already present "
+                  f"(got {conf2['profiles']['base'] if conf2 else 'unparseable'})")
+
+            # single line: existing entries must survive, and a real duplicate is a no-op
+            _out3, conf3, _r3 = profile_edit(
+                '[profiles]\nsolo = ["a", "b"]\n', "c", "solo")
+            check(bool(conf3) and conf3["profiles"]["solo"] == ["a", "b", "c"],
+                  f"single-line insert appends without dropping entries "
+                  f"(got {conf3['profiles']['solo'] if conf3 else 'unparseable'})")
+            _out4, conf4, r4 = profile_edit('[profiles]\nsolo = ["a"]\n', "a", "solo")
+            check(bool(conf4) and conf4["profiles"]["solo"] == ["a"]
+                  and any("already in profile" in a for a in r4.actions),
+                  "an already-present name is a reported no-op, not a silent one")
+
+            # a multi-line array whose last item has no trailing comma: one must be
+            # added to the item, or the result is not parseable TOML at all
+            _out6, conf6, _r6 = profile_edit(
+                '[profiles]\nloose = [\n  "a",\n  "b"   # no trailing comma\n]\n',
+                "c", "loose")
+            check(bool(conf6) and conf6["profiles"]["loose"] == ["a", "b", "c"]
+                  and "# no trailing comma" in _out6,
+                  f"missing trailing comma is supplied on the item "
+                  f"(got {conf6['profiles']['loose'] if conf6 else 'unparseable'})")
+
+            # a profile that is not there at all still warns instead of writing
+            _out5, _conf5, r5 = profile_edit(
+                '[profiles]\nsolo = ["a"]\n', "x", "missing-profile")
+            check(bool(r5.warnings) and not r5.actions,
+                  "unknown profile warns and writes nothing")
+            open(fp, "w").write(saved)
             # enable mine via extra
             dev_fp = p("devices", "testbox.toml")
             open(dev_fp, "a").write('\n')
