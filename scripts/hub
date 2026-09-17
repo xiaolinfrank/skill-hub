@@ -1148,8 +1148,16 @@ def cmd_sync(args, rep):
                 e["local_hash"] = h
                 e["updated_at"] = now_iso()
                 changed = True
+            up = p("upstream", name)
+            if os.path.isdir(up):       # rehash both sides together, so a
+                uh = tree_hash(up)      # stored hash from an older hub version
+                if e.get("upstream_hash") != uh:   # cannot read as a patch
+                    e["upstream_hash"] = uh
+                    changed = True
             if "upstream_hash" in e:
+                was = e.get("patched")
                 e["patched"] = e["upstream_hash"] != h
+                changed = changed or e["patched"] != was
         for name in list(lock["skills"]):
             if name not in skill_names():
                 del lock["skills"][name]
@@ -2007,6 +2015,28 @@ def cmd_selftest(args, rep):
                        p("skills", "mine", "clip.wav"))
             check(tree_hash(p("skills", "mine")) == pristine,
                   "build output, caches and escaping links do not change the hash")
+            # a stored upstream hash from an older hub must not read as a patch
+            lk = load_lock()
+            lk["skills"]["demo"]["upstream_hash"] = "sha256:from-an-older-hub"
+            lk["skills"]["demo"]["patched"] = True
+            save_lock(lk)
+            _dispatch(_parse(["sync", "--no-push"]), Report("rehash-upstream"))
+            e_demo = load_lock()["skills"]["demo"]
+            check(e_demo.get("patched") is False
+                  and e_demo.get("upstream_hash") == tree_hash(p("upstream", "demo")),
+                  f"a stale upstream hash is recomputed, not read as a patch "
+                  f"(patched={e_demo.get('patched')})")
+            demo_md = p("skills", "demo", "SKILL.md")
+            demo_was = open(demo_md).read()
+            open(demo_md, "a").write("a local patch\n")
+            _dispatch(_parse(["sync", "--no-push"]), Report("rehash-patched"))
+            check(load_lock()["skills"]["demo"].get("patched") is True,
+                  "a real local edit is marked patched by the sync refresh")
+            open(demo_md, "w").write(demo_was)
+            _dispatch(_parse(["sync", "--no-push"]), Report("rehash-restore"))
+            check(load_lock()["skills"]["demo"].get("patched") is False,
+                  "reverting the edit clears patched again")
+
             # a local source outside any repo has no git to ask: the walk
             # fallback must still leave build output out
             loose = os.path.join(td, "loose-source")
