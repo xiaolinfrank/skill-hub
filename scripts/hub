@@ -978,6 +978,29 @@ def _rm(fp, dry, rep, why):
         rep.act(f"rm {why}")
 
 
+def escaping_links():
+    """Symlinks in the library whose target resolves outside it.
+
+    Such a link is machine-specific by definition — on every other device it
+    dangles — so sync must never carry it into the shared history. Returns
+    repo-relative paths, sorted. Symlinked directories are listed, never
+    descended into, so a self-referential link cannot loop.
+    """
+    hub = os.path.realpath(HUB_ROOT)
+    found = []
+    for dirpath, dirnames, filenames in os.walk(HUB_ROOT):
+        dirnames[:] = sorted(d for d in dirnames if d != ".git")
+        for name in list(dirnames) + filenames:
+            fp = os.path.join(dirpath, name)
+            if not os.path.islink(fp):
+                continue
+            target = os.path.join(os.path.dirname(fp), os.readlink(fp))
+            real = os.path.realpath(target)
+            if real != hub and not real.startswith(hub + os.sep):
+                found.append(os.path.relpath(fp, HUB_ROOT))
+    return sorted(found)
+
+
 def cmd_sync(args, rep):
     manifest = load_manifest()
     did = device_id(rep)
@@ -991,19 +1014,42 @@ def cmd_sync(args, rep):
         rep.attention("unresolved update conflict(s): " + ", ".join(pend) +
                       " — run `hub update <name> --continue` first; "
                       "commit/pull/push skipped this round")
-    # 1) adopt drift
+    # 1) adopt drift — but never the links that only make sense on this machine
+    escaping = escaping_links()
+    tracked_escaping = []
+    if escaping:
+        r = git(["ls-files", "--error-unmatch", "--"] + escaping, check=False)
+        tracked_escaping = sorted(set(r.stdout.split()))
+        rep.warn(f"{len(escaping)} symlink(s) point outside the library and "
+                 f"were left uncommitted: " + ", ".join(escaping[:5]) +
+                 ("…" if len(escaping) > 5 else ""))
+        rep.data["escaping_links"] = escaping
     st = git(["status", "--porcelain"]).stdout.strip()
     if st and pend:
         pass  # never commit (and spread) half-merged conflict markers
     elif st:
-        n = len(st.splitlines())
         if dry:
-            rep.act(f"[dry] would auto-commit {n} drifted change(s)")
+            rep.act(f"[dry] would auto-commit {len(st.splitlines())} "
+                    f"drifted change(s)")
         else:
             git(["add", "-A"])
-            git(["commit", "--quiet", "-m",
-                 f"sync({did}): auto-commit drift ({n} changes)"])
-            rep.act(f"auto-committed {n} drifted change(s)")
+            if escaping:                     # unstage them; they stay on disk
+                git(["reset", "--quiet", "--"] + escaping, check=False)
+            staged = git(["diff", "--cached", "--name-only"]).stdout.split()
+            if staged:
+                git(["commit", "--quiet", "-m",
+                     f"sync({did}): auto-commit drift ({len(staged)} changes)"])
+                rep.act(f"auto-committed {len(staged)} drifted change(s)")
+    if tracked_escaping:                     # already in history: only a human
+        needs_attention_write(               # should decide to untrack it
+            f"sync({did}): machine-specific symlinks are tracked",
+            [f"{fp} points outside the library and is committed — it dangles "
+             f"on every other device." for fp in tracked_escaping] +
+            ["Untrack on the machine where the link resolves, so its working "
+             "copy survives: `git rm --cached <path>`, add an ignore rule, "
+             "commit."])
+        rep.attention(f"{len(tracked_escaping)} machine-specific symlink(s) "
+                      f"are tracked — see NEEDS_ATTENTION.md")
     # 2) pull --rebase
     if has_remote() and not args.no_pull and not dry and not pend:
         r = run(["git", "pull", "--rebase", "--autostash", "--quiet"],
@@ -1886,6 +1932,52 @@ def cmd_selftest(args, rep):
             check(bool(r5.warnings) and not r5.actions,
                   "unknown profile warns and writes nothing")
             open(fp, "w").write(saved)
+
+            # ---- machine-specific symlinks must never reach shared history ----
+            outside = os.path.join(td, "outside-the-library.txt")
+            open(outside, "w").write("lives on this machine only\n")
+            outdir = os.path.join(td, "outside-dir")
+            os.makedirs(os.path.join(outdir, "nested"), exist_ok=True)
+            esc = p("skills", "mine", "machine-only.txt")
+            os.symlink(outside, esc)                      # absolute file, escapes
+            escdir = p("skills", "mine", "machine-only-dir")
+            os.symlink(outdir, escdir)                    # a directory, escapes
+            inside = p("skills", "mine", "sibling.md")
+            os.symlink("../demo/SKILL.md", inside)        # relative, stays in
+            found = escaping_links()
+            check(found == ["skills/mine/machine-only-dir",
+                            "skills/mine/machine-only.txt"],
+                  f"escaping links are flagged, file and directory alike, "
+                  f"and in-library ones are not (got {found})")
+            r6 = Report("sync-escape")
+            _dispatch(_parse(["sync", "--no-push"]), r6)
+            committed = git(["ls-files", "--", "skills/mine"]).stdout.split()
+            check("skills/mine/machine-only.txt" not in committed
+                  and "skills/mine/machine-only-dir" not in committed
+                  and "skills/mine/sibling.md" in committed,
+                  f"escaping link stays out of git, sibling link goes in "
+                  f"(tracked: {committed})")
+            named = [w for w in r6.warnings if "machine-only.txt" in w]
+            check(os.path.islink(esc) and bool(named),
+                  f"escaping link is left on disk and named in a warning "
+                  f"(warnings: {r6.warnings})")
+            # force it into history, as an older sync would have: must escalate
+            git(["add", "-f", "--", "skills/mine/machine-only.txt"])
+            git(["commit", "--quiet", "-m", "simulate an older sync"])
+            r7 = Report("sync-escape-tracked")
+            _dispatch(_parse(["sync", "--no-push"]), r7)
+            check(r7.exit_code == 1 and bool(r7.needs_attention)
+                  and "machine-only.txt" in
+                  open(p("NEEDS_ATTENTION.md")).read(),
+                  "an already-tracked escaping link raises attention")
+            git(["rm", "--quiet", "--cached", "--",
+                 "skills/mine/machine-only.txt"])
+            os.remove(esc)
+            os.remove(escdir)
+            os.remove(inside)
+            _dispatch(_parse(["sync", "--no-push"]), Report("sync-cleanup"))
+            os.remove(p("NEEDS_ATTENTION.md"))
+
             # enable mine via extra
             dev_fp = p("devices", "testbox.toml")
             open(dev_fp, "a").write('\n')

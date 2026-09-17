@@ -301,6 +301,8 @@ Materialization is the second half of `hub sync` (and the only part that touches
 6. stamp .logs/last_sync
 ```
 
+**Machine-specific symlinks are never committed.** A symlink inside the library whose target resolves outside it dangles on every other device, so sync leaves it on disk, keeps it out of the drift commit, and names it in a warning. Links that stay inside the library — the relative ones a skill ships — are committed normally. A symlinked directory is checked as a link and never descended into, so a self-referential one cannot loop. If such a link is already in history (an older sync, or a hand commit), sync escalates instead: it cannot untrack it for you, because the machine where the link resolves is using it. Untrack it there, so that working copy survives.
+
 Any `needs_attention` item raised during a sync is also appended (deduplicated) to `NEEDS_ATTENTION.md`, so unattended runs leave a trail the next session can pick up. A change you make on machine A — even by editing through the symlink inside an agent session — is committed by A's next sync and arrives at B on B's next sync. Two machines editing the same file between syncs is a rebase conflict: aborted, recorded, resolved semantically by the agent in a session. hub never force-pushes.
 
 ## Install and update (3-way merge)
