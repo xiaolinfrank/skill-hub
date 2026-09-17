@@ -141,23 +141,76 @@ def git_commit_paths(paths, msg):
     return False
 
 
-def tree_hash(path):
-    """Stable content hash of a directory tree (symlinks hashed as targets)."""
-    h = hashlib.sha256()
-    entries = []
+# Regenerable build output, tool caches, and OS litter. None of it is part of
+# a skill's content, and all of it appears only on whichever machine ran the
+# skill — hashing it would flip `patched` back and forth as devices take turns
+# syncing.
+HASH_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                  ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"}
+HASH_SKIP_FILES = {".DS_Store"}
+HASH_SKIP_SUFFIXES = (".pyc", ".pyo")
+
+
+def _git_entries(path):
+    """What git considers content here: tracked, plus untracked-but-not-ignored.
+
+    This is the authority on what belongs to a skill, and it is the only one
+    that can know skill-specific rules — video-talkcraft ships a
+    `workbench/.gitignore` declaring which files its own tooling regenerates
+    per machine. Returns None when `path` is not inside a work tree (a local
+    source directory, say), so the caller walks the tree instead.
+    """
+    r = run(["git", "-C", path, "ls-files", "-z", "--cached", "--others",
+             "--exclude-standard"], check=False)
+    if r.returncode != 0:
+        return None
+    return {rel for rel in r.stdout.split("\0") if rel}
+
+
+def _walk_entries(path):
+    """Every file and symlink under path, minus build output and OS litter."""
+    out = set()
     for root, dirs, files in os.walk(path):
-        dirs[:] = sorted(d for d in dirs if d != ".git")
+        dirs[:] = sorted(d for d in dirs if d not in HASH_SKIP_DIRS)
         for d in list(dirs):            # dir-symlinks: hash as links, no recurse
             dp = os.path.join(root, d)
             if os.path.islink(dp):
-                entries.append((os.path.relpath(dp, path), dp))
+                out.add(os.path.relpath(dp, path))
                 dirs.remove(d)
         for f in sorted(files):
-            if f == ".DS_Store":
+            if f in HASH_SKIP_FILES or f.endswith(HASH_SKIP_SUFFIXES):
                 continue
-            fp = os.path.join(root, f)
-            entries.append((os.path.relpath(fp, path), fp))
-    for rel, fp in sorted(entries):
+            out.add(os.path.relpath(os.path.join(root, f), path))
+    return out
+
+
+def tree_hash(path):
+    """Stable content hash of a directory tree.
+
+    Only content counts, so the same skill hashes the same on every device:
+    whatever git ignores is left out (that covers node_modules, caches, and
+    anything a skill's own .gitignore declares as generated), and so is any
+    symlink resolving outside the tree, whose target is a path on one machine.
+    Symlinks that stay inside are hashed as their target text, and symlinked
+    directories are listed rather than descended into.
+    """
+    h = hashlib.sha256()
+    root_real = os.path.realpath(path)
+    rels = _git_entries(path)
+    if rels is None:
+        rels = _walk_entries(path)
+    else:
+        rels = {r for r in rels
+                if not any(part in HASH_SKIP_DIRS for part in r.split(os.sep))
+                and os.path.basename(r) not in HASH_SKIP_FILES
+                and not r.endswith(HASH_SKIP_SUFFIXES)}
+    for rel in sorted(rels):
+        fp = os.path.join(path, rel)
+        if os.path.islink(fp):
+            target = os.path.join(os.path.dirname(fp), os.readlink(fp))
+            real = os.path.realpath(target)
+            if real != root_real and not real.startswith(root_real + os.sep):
+                continue                # leaves the tree: machine-specific
         h.update(rel.encode())
         if os.path.islink(fp):
             h.update(b"L" + os.readlink(fp).encode())
@@ -1932,6 +1985,66 @@ def cmd_selftest(args, rep):
             check(bool(r5.warnings) and not r5.actions,
                   "unknown profile warns and writes nothing")
             open(fp, "w").write(saved)
+
+            # ---- the hash must not notice what a machine did to the skill ----
+            bare = tree_hash(p("skills", "mine"))
+            os.symlink("SKILL.md", p("skills", "mine", "alias.md"))  # stays in
+            pristine = tree_hash(p("skills", "mine"))
+            check(pristine != bare,
+                  "a link that stays inside the tree counts toward the hash")
+            os.makedirs(p("skills", "mine", "node_modules", "left-pad"))
+            open(p("skills", "mine", "node_modules", "left-pad", "i.js"),
+                 "w").write("module.exports=1\n")
+            os.makedirs(p("skills", "mine", "scripts", "__pycache__"))
+            open(p("skills", "mine", "scripts", "__pycache__", "x.cpython.pyc"),
+                 "wb").write(b"\x00bytecode")
+            open(p("skills", "mine", "stray.pyc"), "wb").write(b"\x00stray")
+            open(p("skills", "mine", ".DS_Store"), "wb").write(b"\x00finder")
+            elsewhere = os.path.join(td, "someone-elses-project")
+            os.makedirs(elsewhere, exist_ok=True)
+            open(os.path.join(elsewhere, "clip.wav"), "w").write("audio\n")
+            os.symlink(os.path.join(elsewhere, "clip.wav"),
+                       p("skills", "mine", "clip.wav"))
+            check(tree_hash(p("skills", "mine")) == pristine,
+                  "build output, caches and escaping links do not change the hash")
+            # a local source outside any repo has no git to ask: the walk
+            # fallback must still leave build output out
+            loose = os.path.join(td, "loose-source")
+            os.makedirs(os.path.join(loose, "node_modules", "pkg"))
+            open(os.path.join(loose, "SKILL.md"), "w").write(
+                "---\nname: loose\n---\nhi\n")
+            open(os.path.join(loose, "node_modules", "pkg", "a.js"),
+                 "w").write("1\n")
+            loose_hash = tree_hash(loose)
+            open(os.path.join(loose, "node_modules", "pkg", "b.js"),
+                 "w").write("2\n")
+            open(os.path.join(loose, ".DS_Store"), "wb").write(b"\x00")
+            check(tree_hash(loose) == loose_hash,
+                  "outside a git repo the walk still skips build output")
+            open(os.path.join(loose, "real.md"), "w").write("content\n")
+            check(tree_hash(loose) != loose_hash,
+                  "outside a git repo a real file still counts")
+
+            # a skill declaring its own generated files is obeyed — no hardcoded
+            # list could know these names
+            open(p("skills", "mine", ".gitignore"), "w").write(
+                "# regenerated per machine by this skill's own tooling\n"
+                "generated-here.ts\n")
+            after_ignore = tree_hash(p("skills", "mine"))
+            open(p("skills", "mine", "generated-here.ts"), "w").write("export{}\n")
+            check(tree_hash(p("skills", "mine")) == after_ignore,
+                  "a file the skill's own .gitignore declares is left out of the hash")
+            real_edit = p("skills", "mine", "SKILL.md")
+            open(real_edit, "a").write("a real local change\n")
+            check(tree_hash(p("skills", "mine")) != pristine,
+                  "a real edit still changes the hash")
+            open(real_edit, "w").write("---\nname: mine\n---\nhi\n")
+            shutil.rmtree(p("skills", "mine", "node_modules"))
+            shutil.rmtree(p("skills", "mine", "scripts"))
+            for junk in ("stray.pyc", ".DS_Store", "clip.wav", "alias.md",
+                         "generated-here.ts", ".gitignore"):
+                os.remove(p("skills", "mine", junk))
+            _dispatch(_parse(["sync", "--no-push"]), Report("rehash"))
 
             # ---- machine-specific symlinks must never reach shared history ----
             outside = os.path.join(td, "outside-the-library.txt")
