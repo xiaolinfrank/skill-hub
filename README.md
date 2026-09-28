@@ -157,6 +157,7 @@ Two names inside render targets are always left alone: `synced/` (where claude.a
 [hub]
 schema = 1
 default_agents = ["claude", "agents-std"]   # agents that receive every enabled skill by default
+# doctor_known_dirs_ignore = ["~/.cursor/skills"]   # paths doctor check 14 should stop suggesting
 
 [agents.claude]                 # a render target
 target  = "~/.claude/skills"
@@ -189,7 +190,18 @@ pin    = true                   # frozen: `update` skips it
 
 Which agent gets a skill: an agent listed in `default_agents` receives every enabled skill unless a `[skills.<name>]` block narrows it with `agents = [...]`. An agent **not** in `default_agents` receives only skills whose block lists it — so when you add a new render target you normally add it to `default_agents` too. If your agent reads a directory of its own or does not follow symlinks, declare a second target with `mode = "copy"` (like `codex-legacy`) and add it to the device's `agents`.
 
-hub writes to `hub.toml` in exactly two ways: `install`/`adopt` **append** a `[skills.<name>]` block (append-only text, no TOML serializer round-trip), and `install --profile P` inserts the name into the single-line array of profile `P` inside the `[profiles]` section. Everything else — reorganizing profiles, removing blocks — is a text edit by you or your agent; hub validates with `tomllib` on the next read and refuses to run (exit 2) on syntax errors. Note that `origin` in `hub.toml` is informational: the lockfile's `origin` is what `update` consults, and it is set by `install` / `adopt --origin vendor`. Hand-placing a directory into `skills/` makes it `self`.
+### Onboarding an agent hub doesn't know about
+
+When a new agent app appears (a desktop client, a new CLI), don't guess its config — extract the ground truth from the app itself, then verify before committing config.
+
+1. **Find the real scan dirs.** Inspect the app's own state rather than its marketing docs: cache/index JSON files, plist or settings files, and log lines usually leak the exact directories it watches. (One desktop app's skill-list cache turned out to enumerate its scan dirs verbatim.)
+2. **Probe with a canary.** Hand-place ONE symlink into the candidate dir and watch whether the app picks it up (an fs watcher or an app restart). If links are ignored, retry with a copied directory — that decides `mode = "symlink"` vs `mode = "copy"`. Only after the app sees the canary do you touch hub.toml.
+3. **Register opt-in.** Run `hub agent-add <name> --target <dir>` (or hand-edit: append an `[agents.<name>]` block and add the name to your device's `agents` array). Deliberately do **not** add it to `default_agents`; scope skills per-skill with `[skills.<name>] agents = ["claude", "agents-std", "<name>"]` so only intended skills reach the new app. Registering changes what flows into another agent's context — that's why agent-add is confirmation-gated.
+4. **Foreign entries are safe.** hub only ever touches links it created; the app's own subdirectories (marketplace caches, dot-dirs) are report-only in doctor check 3. Add `protect` entries if the app manages subdirs of its own. Run `hub census --dirs <dir>` first if the app already has skills you may want to adopt.
+
+From then on doctor check 14 covers the reverse direction: when a well-known agent dir exists on a machine but isn't registered, doctor flags it (report-only) — so a freshly onboarded machine notices the agents you installed there.
+
+hub writes to `hub.toml` in exactly three ways: `install`/`adopt` **append** a `[skills.<name>]` block (append-only text, no TOML serializer round-trip), `install --profile P` inserts the name into the array of profile `P` inside the `[profiles]` section, and `agent-add` appends an `[agents.<name>]` block (plus the name in a device file's `agents` array). Everything else — reorganizing profiles, removing blocks — is a text edit by you or your agent; hub validates with `tomllib` on the next read and refuses to run (exit 2) on syntax errors. `[hub]` also accepts `doctor_known_dirs_ignore = [...]`: paths doctor check 14 should stop suggesting as render targets. Note that `origin` in `hub.toml` is informational: the lockfile's `origin` is what `update` consults, and it is set by `install` / `adopt --origin vendor`. Hand-placing a directory into `skills/` makes it `self`.
 
 ### `devices/<id>.toml` — per-device selection
 
@@ -369,8 +381,11 @@ Same-name candidates are compared by content hash: identical copies collapse to 
 | 9 | **old dual-clone revival**: `~/.claude/skills` or `~/.agents/skills` has become a git repo again | report (red) |
 | 12 | device id file missing; last sync older than 3 days | report |
 | 13 | lockfile merge driver not registered in this clone | report |
+| 14 | a well-known agent skill dir exists on this machine and holds skills, but is not a render target | report only |
 
 Checks 1, 2, 4, 9, 13 are *hard*: if any remains unfixed, doctor exits 1 with `needs_attention`. `--fix` only acts on targets of agents enabled in **this device's** file; other targets are report-only. Checks 10 (same skill reachable via several paths) and 11 (stale plugin-cache audit) are reserved.
+
+Check 14 works off a small curated `KNOWN_AGENT_DIRS` list in the script; entries are added only with a verified source (vendor docs or observed on-machine behavior, dated). A dir counts only when it holds at least one plausible skill (a non-dot entry whose resolution contains `SKILL.md`) — installers love leaving empty dirs behind. Git-repo dirs are skipped (check 9's territory), and `[hub] doctor_known_dirs_ignore = [...]` silences a path you deliberately keep unmanaged. hub never auto-registers a render target: the check is a suggestion, not an action.
 
 ## The agent contract
 
@@ -426,6 +441,7 @@ Second machine: seal (step 0), clone the instance, `hub census` for anything uni
 | command | notes |
 |---|---|
 | `hub init` | scaffold an instance at `$SKILL_HUB_ROOT` (default `~/skills-hub`), `git init` if needed |
+| `hub agent-add NAME --target DIR [--mode symlink\|copy] [--default] [--device ID \| --all-devices] [--protect a,b] [--yes]` | register a render target: appends `[agents.NAME]` + the device `agents` entry; confirmation-gated without `--yes`; opt-in unless `--default`; re-running converges (repairs the device entry, applies `--default`) — changing target/mode/protect of a registered agent stays a manual edit |
 | `hub onboard [--device NAME] [--no-bin] [--with-hook] [--with-launchd]` | register this machine; idempotent |
 | `hub census [--dirs D…] [--out FILE]` | classify existing render targets, read-only |
 | `hub adopt PATH [--name N] [--origin self\|vendor] [--source SPEC]` | absorb a directory |
@@ -448,7 +464,7 @@ Environment: `SKILL_HUB_ROOT` (instance path), `SKILL_HUB_DEVICE_FILE` (default 
 - No `uninstall` yet: delete `skills/<name>`, `upstream/<name>`, the `[skills.<name>]` block, and the name from any `[profiles]` array or device `extra` list; the next `sync` drops the lock entry and removes the links.
 - `update` has no `--dry-run`/`--abort`; preview with `--check` and `hub diff`, revert with git.
 - Source types are `git+…` and local paths; installer registries (ClawHub-style) are planned.
-- Doctor checks 10 and 11 are reserved (see table).
+- Doctor checks 10 and 11 are reserved (see table). Agent detection is deliberately suggestion-only: check 14 notices unmanaged known agent dirs and `hub agent-add` registers one, but adding a render target is always a confirmed decision (SKILL.md §4) — hub will never auto-register.
 - Automation is macOS `launchd`; Linux users schedule the two commands themselves. Windows is not supported (symlink semantics).
 - Cloud/hosted agent sessions do not read local directories; expose skills to them by their own mechanisms.
 

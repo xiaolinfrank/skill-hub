@@ -17,8 +17,10 @@ needs_attention, data}.
 import argparse
 import atexit
 import datetime
+import difflib
 import fnmatch
 import hashlib
+import io
 import json
 import os
 import re
@@ -43,6 +45,21 @@ CACHE_PREFIX = os.path.join(
     os.path.expanduser("~/.claude"), "plugins", "cache") + os.sep
 PROTECT_ALWAYS = {"synced", ".system"}
 SCHEMA = 1
+
+# Well-known agent skill directories. Doctor check 14, census and onboard use
+# this list to NOTICE an unmanaged agent dir — never to auto-register one
+# (registering changes what flows into another agent's context; that stays a
+# human decision per SKILL.md §4). Add an entry only with a verified source
+# (vendor docs, or observed on-machine behavior, dated): a wrong entry nags
+# every user on every doctor run.
+KNOWN_AGENT_DIRS = (
+    ("claude", "~/.claude/skills"),
+    ("agents-std", "~/.agents/skills"),
+    ("codex", "~/.codex/skills"),
+    # verified 2026-09-28: the WorkBuddy macOS app scans only this dir (plus its
+    # own marketplace dir), follows symlinks, and hot-reloads on fs events.
+    ("workbuddy", "~/.workbuddy/skills"),
+)
 
 
 def is_cache_path(fp):
@@ -504,7 +521,7 @@ base = ["skill-hub"]
         rep.act("wrote .gitattributes")
     if not os.path.exists(p(".gitignore")):
         with open(p(".gitignore"), "w") as fh:
-            fh.write(".DS_Store\n.logs/\n.hub-pending/\n*.tmp\n")
+            fh.write(".DS_Store\n.logs/\n.hub-pending/\n*.tmp\n*.hub-tmp\n")
         rep.act("wrote .gitignore")
     if not os.path.isdir(p(".git")):
         git(["init", "--quiet"])
@@ -553,6 +570,16 @@ def cmd_onboard(args, rep):
         _install_hook(rep)
     if args.with_launchd:
         _install_launchd(rep)
+    # informational only: point at agent dirs hub could also render to
+    try:
+        manifest = load_manifest()
+    except FileNotFoundError:
+        manifest = None
+    if manifest is not None:
+        for name, path in _unmanaged_agent_dirs(
+                manifest, os.path.expanduser("~"), KNOWN_AGENT_DIRS):
+            rep.act(f"detected agent dir {path} — run `hub agent-add {name} "
+                    f"--target {path}` if hub should render there too")
     rep.data["device"] = did
 
 
@@ -635,8 +662,9 @@ def _git_top_and_remote(path):
 
 
 def cmd_census(args, rep):
-    dirs = [os.path.expanduser(d) for d in (args.dirs or [
-        "~/.claude/skills", "~/.agents/skills", "~/.codex/skills"])]
+    raw_dirs = args.dirs or ["~/.claude/skills", "~/.agents/skills",
+                             "~/.codex/skills"]
+    dirs = [os.path.expanduser(d) for d in raw_dirs]
     scanned_real = [os.path.realpath(d) for d in dirs if os.path.isdir(d)]
     rows = []
     for d in dirs:
@@ -729,6 +757,29 @@ def cmd_census(args, rep):
     if conflicts:
         rep.warn(f"{len(conflicts)} same-name-different-content conflicts: "
                  + ", ".join(conflicts))
+    # discovery hint: a scanned dir hub doesn't render to is worth naming
+    try:
+        manifest = load_manifest()
+    except FileNotFoundError:
+        manifest = None
+    if manifest is not None:
+        known_by_path = {d: n for n, d in KNOWN_AGENT_DIRS}
+        candidates = []
+        for d in raw_dirs:
+            suggested = known_by_path.get(d)
+            if suggested is None:
+                parts = [x for x in d.rstrip("/").split("/") if x]
+                base = parts[-1] if parts else ""
+                if base.lower() in ("skills", "skill") and len(parts) > 1:
+                    base = parts[-1 - 1]          # container name: climb up
+                suggested = normalize_name(base.lstrip("."))
+                if not NAME_RE.match(suggested):
+                    suggested = "new-agent"
+            candidates.append((suggested, d))
+        for name, dpath in _unmanaged_agent_dirs(
+                manifest, os.path.expanduser("~"), candidates):
+            rep.act(f"unmanaged agent dir: {dpath} — consider "
+                    f"`hub agent-add {name} --target {dpath}`")
 
 
 # ---------------------------------------------------------------- adopt
@@ -1328,28 +1379,63 @@ def _array_insert(body, name):
     return "\n".join(lines)
 
 
-def _add_to_profile(name, profile, rep):
-    """Text surgery: add name to a profile array, single-line or multi-line."""
-    fp = p("hub.toml")
-    text = open(fp).read()
-    sec = re.search(r"(?ms)^\[profiles\]\s*$.*?(?=^\[|\Z)", text)
-    if not sec:
-        rep.warn(f"[profiles] section not found — add \"{name}\" manually")
-        return
-    span = _array_span(text, profile, sec.start(), sec.end())
+def _add_to_array_text(text, key, name, section=None):
+    """(new_text, status): add name to the TOML array `key`, purely on text.
+
+    status is one of "added" | "already" | "no-section" | "no-array". With
+    `section` given, only the array declared inside that `[section]` counts;
+    without it the scan is bound to the file's TOP-LEVEL region (the text
+    before the first table header) — TOML keys after a `[table]` header belong
+    to that table, so e.g. a device file's `[[external]]` blocks carry their
+    own arrays that must never receive a top-level name.
+    """
+    if section is None:
+        start = 0
+        hdr = re.search(r"(?m)^\[", text)
+        end = hdr.start() if hdr else len(text)
+    else:
+        sec = re.search(rf"(?ms)^\[{re.escape(section)}\]\s*$.*?(?=^\[|\Z)",
+                        text)
+        if not sec:
+            return text, "no-section"
+        start, end = sec.start(), sec.end()
+    span = _array_span(text, key, start, end)
     if not span:
-        rep.warn(f"profile '{profile}' not found as an array in [profiles] — "
-                 f"add \"{name}\" to it manually")
-        return
+        return text, "no-array"
     i, j = span
     body = text[i + 1:j]
     if _array_has(body, name):
-        rep.act(f"{name} already in profile '{profile}'")
-        return
-    text = text[:i + 1] + _array_insert(body, name) + text[j:]
+        return text, "already"
+    return text[:i + 1] + _array_insert(body, name) + text[j:], "added"
+
+
+def _add_to_array(fp, key, name, rep, section=None, label=None):
+    """Text surgery: add name to an array in `fp`. Returns True when the
+    array now lists name (whether it was added or already there)."""
+    label = label or f"'{key}'"
+    text = open(fp).read()
+    new_text, status = _add_to_array_text(text, key, name, section)
+    if status == "no-section":
+        rep.warn(f"[{section}] section not found — add \"{name}\" manually")
+        return False
+    if status == "no-array":
+        where = f"[{section}]" if section else os.path.basename(fp)
+        rep.warn(f"{label} not found as an array in {where} — "
+                 f"add \"{name}\" to it manually")
+        return False
+    if status == "already":
+        rep.act(f"{name} already in {label}")
+        return True
     with open(fp, "w") as fh:
-        fh.write(text)
-    rep.act(f"added {name} to profile '{profile}'")
+        fh.write(new_text)
+    rep.act(f"added {name} to {label}")
+    return True
+
+
+def _add_to_profile(name, profile, rep):
+    """Text surgery: add name to a profile array, single-line or multi-line."""
+    _add_to_array(p("hub.toml"), profile, name, rep, section="profiles",
+                  label=f"profile '{profile}'")
 
 
 def _merge_trees(base, ours, theirs, rep, name):
@@ -1606,6 +1692,281 @@ def _update_continue(args, rep, lock):
 # ---------------------------------------------------------------- doctor / status / diff
 
 
+def cmd_agent_add(args, rep):
+    """Register a new render target: [agents.<name>] in hub.toml plus the name
+    in a device file's top-level agents array.
+
+    This is the one structural edit SKILL.md §4 escalates, so the command is
+    confirmation-gated: without --yes it prints the diff (to stderr, keeping
+    --json's stdout clean) and asks (tty) or refuses (non-tty, exit 2); EOF at
+    the prompt is a clean decline. New agents are OPT-IN by default — no skill
+    renders to them until a [skills.<name>] agents list names them; --default
+    adds the agent to default_agents instead (every enabled skill renders).
+
+    Re-running on a registered agent converges instead of blind no-op: the
+    device entry and a requested --default are still applied; a different
+    --target is refused (changing a target is a structural edit, §4).
+    """
+    name = normalize_name(args.name)
+    if not NAME_RE.match(name):
+        rep.fail(f"invalid agent name '{args.name}'", 2)
+        return
+    manifest = load_manifest()
+    existing = manifest.get("agents", {}).get(name)
+    target = os.path.expanduser(args.target)
+    if existing is not None:
+        registered = os.path.expanduser(existing.get("target", ""))
+        if not _same_path(os.path.realpath(registered),
+                          os.path.realpath(target)):
+            rep.fail(f"agent '{name}' already registered with target "
+                     f"{existing.get('target')} — changing it is a manual "
+                     f"hub.toml edit (SKILL.md §4)", 2)
+            return
+        if existing.get("mode") != args.mode:
+            rep.warn(f"'{name}' registered with mode={existing.get('mode')} "
+                     f"(requested {args.mode}) — edit hub.toml to change it")
+        if args.protect:
+            want = sorted(x.strip() for x in args.protect.split(",")
+                          if x.strip())
+            if sorted(existing.get("protect", [])) != want:
+                rep.warn(f"'{name}' registered with protect="
+                         f"{existing.get('protect', [])} (requested {want}) — "
+                         f"edit hub.toml to change it")
+    else:
+        # target sanity before anything is created or written
+        if not args.target.strip():
+            rep.fail("--target must not be empty", 2)
+            return
+        if os.path.islink(target):
+            rep.fail(f"target {args.target} is itself a symlink — refusing "
+                     f"(same rule as sync)", 2)
+            return
+        if os.path.lexists(target) and not os.path.isdir(target):
+            rep.fail(f"target {args.target} exists and is not a directory", 2)
+            return
+        hub_real = os.path.realpath(HUB_ROOT)
+        target_real = os.path.realpath(target)
+        if target_real == hub_real or target_real.startswith(hub_real + os.sep):
+            rep.fail(f"target {args.target} is inside the hub itself — "
+                     f"render targets live outside the library", 2)
+            return
+        for other, cfg in manifest.get("agents", {}).items():
+            ot = cfg.get("target")
+            if ot and _same_path(os.path.realpath(os.path.expanduser(ot)),
+                                 target_real):
+                rep.fail(f"target {args.target} is already agent '{other}'s "
+                         f"target — two agents on one dir makes sync's "
+                         f"cleanup fight itself", 2)
+                return
+    # device selection (shared by the register and converge paths)
+    if args.all_devices:
+        devdir = p("devices")
+        dev_fps = sorted(os.path.join(devdir, f)
+                         for f in os.listdir(devdir)
+                         if f.endswith(".toml")) if os.path.isdir(devdir) else []
+        if not dev_fps:
+            rep.fail(f"no device files under {devdir}", 2)
+            return
+    else:
+        did = args.device
+        if not did and os.path.exists(DEVICE_FILE):
+            did = open(DEVICE_FILE).read().strip()
+        did = normalize_name(did or "")
+        if not NAME_RE.match(did):
+            rep.fail("no valid device — pass --device NAME or --all-devices "
+                     f"(got '{args.device or did or '∅'}')", 2)
+            return
+        dev_fp = p("devices", f"{did}.toml")
+        devdir_real = os.path.realpath(p("devices"))
+        if not os.path.realpath(dev_fp).startswith(devdir_real + os.sep):
+            rep.fail(f"device id '{did}' escapes devices/ — refusing", 2)
+            return
+        if not os.path.exists(dev_fp):
+            rep.fail(f"{dev_fp} not found", 2)
+            return
+        dev_fps = [dev_fp]
+    # compute every edit first; validate all; write nothing until confirmed
+    hub_fp = p("hub.toml")
+    hub_text = open(hub_fp).read()
+    hub_new = hub_text
+    if existing is None:
+        protect = [x.strip() for x in args.protect.split(",") if x.strip()]
+        # json.dumps output is a valid TOML basic string: quotes, backslashes
+        # and control chars are escaped, so the parsed value round-trips
+        hub_new += (f'\n[agents.{name}]\ntarget  = {json.dumps(args.target)}\n'
+                    f'mode    = {json.dumps(args.mode)}\n')
+        if protect:
+            hub_new += "protect = [" + \
+                ", ".join(json.dumps(x) for x in protect) + "]\n"
+    edits = []
+    device_failed = False
+    for fp in dev_fps:
+        text = open(fp).read()
+        new_text, status = _add_to_array_text(text, "agents", name)
+        if status == "added":
+            edits.append((fp, text, new_text))
+        elif status == "already":
+            rep.act(f"{name} already in agents of {os.path.basename(fp)}")
+        else:
+            device_failed = True
+            rep.warn(f"{os.path.basename(fp)} has no top-level agents array — "
+                     f"add \"{name}\" to it manually")
+    default_done = False
+    if args.default:
+        hub_d, status = _add_to_array_text(hub_new, "default_agents", name,
+                                           section="hub")
+        if status == "added":
+            hub_new = hub_d
+            default_done = True
+        elif status == "already":
+            default_done = True
+        else:
+            rep.warn("[hub] default_agents array not found — add it manually")
+    if hub_new != hub_text:
+        edits.append((hub_fp, hub_text, hub_new))   # hub.toml LAST: commit point
+    if not edits:
+        rep.act(f"agent '{name}' already fully registered — nothing to do")
+        return
+    if existing is not None:
+        rep.act(f"agent '{name}' already registered — converging "
+                f"device/default state")
+    for fp, _old, new in edits:
+        try:
+            tomllib.loads(new)
+        except tomllib.TOMLDecodeError as e:
+            rep.fail(f"refusing to write invalid TOML to "
+                     f"{os.path.basename(fp)}: {e}", 2)
+            return
+    if not args.yes:
+        diff = "".join(line
+                       for fp, old, new in edits if old != new
+                       for line in difflib.unified_diff(
+                           old.splitlines(True), new.splitlines(True),
+                           fromfile=os.path.basename(fp),
+                           tofile=os.path.basename(fp) + " (new)"))
+        if diff:
+            rep.data["diff"] = diff
+            sys.stderr.write(diff)      # preview; stdout stays JSON-clean
+        if not sys.stdin.isatty():
+            rep.fail("agent-add changes [agents.*] structure — re-run "
+                     "interactively or pass --yes", 2)
+            return
+        sys.stderr.write("apply these edits? [y/N] ")
+        sys.stderr.flush()
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+            rep.fail("aborted — no files changed", 2)
+            return
+    # target dir first: an unwritable one fails here, before any config
+    # write (materialize would mkdir at sync time anyway — better to know now)
+    if existing is None and not os.path.isdir(target):
+        os.makedirs(target, exist_ok=True)          # OSError → exit 2, no writes
+        rep.act(f"mkdir {target}")
+    # lost-update guard: the diff the human approved must still be current
+    for fp, old, _new in edits:
+        if open(fp).read() != old:
+            rep.fail(f"{os.path.basename(fp)} changed since the diff was "
+                     f"computed — re-run hub agent-add", 2)
+            return
+    for fp, _old, new in edits:         # device files first, hub.toml last
+        real_fp = os.path.realpath(fp) if os.path.islink(fp) else fp
+        tmp = real_fp + ".hub-tmp"
+        with open(tmp, "w") as fh:
+            fh.write(new)
+        os.replace(tmp, real_fp)
+        rep.act(f"updated {os.path.relpath(fp, HUB_ROOT)}")
+    if args.default and default_done:
+        rep.warn(f"'{name}' is now in default_agents — EVERY enabled skill "
+                 f"will render to {args.target}. Prefer opt-in scoping: "
+                 f"[skills.<name>] agents = [..., \"{name}\"]")
+    elif not args.default:
+        rep.act(f"'{name}' is opt-in: no skill renders to it until a "
+                f"[skills.<name>] agents list names it (or re-run with "
+                f"--default)")
+    if device_failed or (args.default and not default_done):
+        rep.attention(f"'{name}' registered but not fully applied — see "
+                      f"warnings; the missing pieces are manual edits")
+    rep.act("next: hub sync --dry-run")
+
+
+def _expand_home(path, home):
+    """Expand a leading ~/ against an explicit home (testable expanduser)."""
+    if path == "~":
+        return home
+    if path.startswith("~/"):
+        return os.path.join(home, path[2:])
+    return path
+
+
+def _has_plausible_skill(dirpath):
+    """True when dirpath holds at least one entry that looks like a skill.
+
+    A plausible skill is a non-dot subdirectory or symlink whose resolution
+    contains a SKILL.md. This is the false-positive guard for agent-dir
+    detection: installers love leaving empty dirs behind. os.path.isdir and
+    os.path.exists both follow symlinks, so linked skills count.
+    """
+    try:
+        entries = os.listdir(dirpath)
+    except OSError:
+        return False
+    for entry in entries:
+        if entry.startswith("."):
+            continue
+        fp = os.path.join(dirpath, entry)
+        if os.path.isdir(fp) and os.path.exists(os.path.join(fp, "SKILL.md")):
+            return True
+    return False
+
+
+def _same_path(a, b):
+    """Filesystem-aware path equality: samefile when both sides exist (a
+    case-insensitive filesystem disagrees with realpath's string case),
+    falling back to string compare when either side is gone."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return a == b
+
+
+def _unmanaged_agent_dirs(manifest, home, candidates):
+    """Agent dirs that exist and hold skills yet are not hub render targets.
+
+    candidates: iterable of (suggested_name, path-with-~). Pure apart from fs
+    stat/listdir; `home` is a parameter so selftest can drive a temp HOME.
+    Returns [(suggested_name, display_path)] with realpath duplicates removed.
+    Skips: registered targets (by realpath), anything inside the hub itself,
+    dirs without a plausible skill, git repos (check 9's territory), and paths
+    in the manifest's [hub] doctor_known_dirs_ignore list.
+    """
+    targets = [os.path.realpath(_expand_home(t, home))
+               for cfg in manifest.get("agents", {}).values()
+               for t in [cfg.get("target")] if t]
+    ignore_raw = manifest.get("hub", {}).get("doctor_known_dirs_ignore", [])
+    if isinstance(ignore_raw, str):          # mistyped TOML: coerce, don't crash
+        ignore_raw = [ignore_raw]
+    ignore = [os.path.realpath(_expand_home(d, home)) for d in ignore_raw]
+    hub_real = os.path.realpath(HUB_ROOT)
+    seen, out = [], []
+    for name, path in candidates:
+        full = _expand_home(path, home)
+        if not os.path.isdir(full):
+            continue
+        real = os.path.realpath(full)
+        if any(_same_path(real, s) for s in seen) or \
+                any(_same_path(real, t) for t in targets) or \
+                any(_same_path(real, i) for i in ignore):
+            continue
+        seen.append(real)
+        if real == hub_real or real.startswith(hub_real + os.sep):
+            continue
+        if os.path.exists(os.path.join(full, ".git")):
+            continue                      # a git repo is check 9's territory
+        if not _has_plausible_skill(full):
+            continue
+        out.append((name, path))
+    return out
+
+
 def cmd_doctor(args, rep):
     manifest = load_manifest()
     lock = load_lock()
@@ -1724,6 +2085,14 @@ def cmd_doctor(args, rep):
         if os.path.exists(gd) and os.path.realpath(
                 os.path.expanduser(d)) != os.path.realpath(HUB_ROOT):
             issue(9, f"RED: {d} is a git repo again (old dual-clone revival!)")
+    # 14 known agent dir present but unmanaged (report-only, never in `hard`):
+    # an unmanaged agent dir is a valid configuration, so this stays warn-level
+    for name, path in _unmanaged_agent_dirs(
+            manifest, os.path.expanduser("~"), KNOWN_AGENT_DIRS):
+        issue(14, f"known agent dir {path} holds skills but is not a hub "
+                  f"render target — register with `hub agent-add {name} "
+                  f"--target {path}` (SKILL.md §4: confirm with the human "
+                  f"first), or silence via [hub] doctor_known_dirs_ignore")
     # 12 schedule health
     if not os.path.exists(DEVICE_FILE):
         issue(12, f"device id file missing ({DEVICE_FILE})")
@@ -1903,12 +2272,33 @@ def cmd_selftest(args, rep):
             open(p("hub.toml"), "w").write(manifest_txt)
             git(["add", "-A"])
             git(["commit", "--quiet", "-m", "scaffold"])
-            # onboard
-            r0 = Report("onboard")
-            _dispatch(_parse(["onboard", "--device", "testbox", "--no-bin"]), r0)
-            check(open(DEVICE_FILE).read().strip() == "testbox", "onboard writes device id")
-            check(git(["config", "merge.hub-lock.driver"],
-                      check=False).returncode == 0, "merge driver registered")
+            # onboard (under a controlled HOME so real machine state can't leak in)
+            home_onb = os.path.join(td, "home-onboard")
+            os.makedirs(home_onb)
+            real_home = os.environ.get("HOME")
+            os.environ["HOME"] = home_onb
+            try:
+                r0 = Report("onboard")
+                _dispatch(_parse(["onboard", "--device", "testbox", "--no-bin"]), r0)
+                check(open(DEVICE_FILE).read().strip() == "testbox", "onboard writes device id")
+                check(git(["config", "merge.hub-lock.driver"],
+                          check=False).returncode == 0, "merge driver registered")
+                check(not any("detected agent dir" in a for a in r0.actions),
+                      "onboard prints no agent hint under a bare HOME")
+                wb_onb = os.path.join(home_onb, ".workbuddy", "skills")
+                os.makedirs(os.path.join(wb_onb, "demo"))
+                open(os.path.join(wb_onb, "demo", "SKILL.md"), "w").write("x\n")
+                r0b = Report("onboard-hint")
+                _dispatch(_parse(["onboard", "--device", "testbox",
+                                  "--no-bin"]), r0b)
+                check(any("detected agent dir" in a and "agent-add" in a
+                          for a in r0b.actions),
+                      "onboard hints at a detected-but-unmanaged agent dir")
+            finally:
+                if real_home is None:
+                    del os.environ["HOME"]
+                else:
+                    os.environ["HOME"] = real_home
             # self-written skill
             os.makedirs(p("skills", "mine"))
             open(p("skills", "mine", "SKILL.md"), "w").write("---\nname: mine\n---\nhi\n")
@@ -2194,6 +2584,195 @@ def cmd_selftest(args, rep):
             check(os.path.islink(os.path.join(claude_t, "extref")) and
                   not os.path.lexists(os.path.join(agents_t, "extref")),
                   "external link only on declared agent")
+            # ---- agent-add: register a render target atomically ----
+            wb_t = os.path.join(td, "t-wb")
+            hub_txt_pre_wb = open(p("hub.toml")).read()
+            ra = Report("agent-add")
+            _dispatch(_parse(["agent-add", "wb", "--target", wb_t, "--yes"]), ra)
+            m_after = load_manifest()
+            check(ra.exit_code == 0
+                  and m_after["agents"]["wb"]["target"] == wb_t
+                  and m_after["agents"]["wb"]["mode"] == "symlink"
+                  and os.path.isdir(wb_t),
+                  f"agent-add writes [agents.wb] and makes the target "
+                  f"(warnings: {ra.warnings})")
+            check(open(p("hub.toml")).read() == hub_txt_pre_wb +
+                  f'\n[agents.wb]\ntarget  = {json.dumps(wb_t)}\n'
+                  f'mode    = "symlink"\n',
+                  "agent-add appends exactly one block, byte-for-byte")
+            check("wb" in tomllib.loads(open(dev_fp).read())["agents"],
+                  "agent-add adds the name to the device agents array")
+            # opt-in by default: nothing renders to wb until a skill says so
+            _dispatch(_parse(["sync"]), Report("sync-wb0"))
+            check(not os.path.lexists(os.path.join(wb_t, "mine")),
+                  "opt-in agent receives nothing without per-skill scoping")
+            with open(p("hub.toml"), "a") as fh:
+                fh.write('\n[skills.mine]\nagents = ["claude", "agents-std", "wb"]\n')
+            _dispatch(_parse(["sync"]), Report("sync-wb1"))
+            check(os.path.islink(os.path.join(wb_t, "mine"))
+                  and not os.path.lexists(os.path.join(wb_t, "demo")),
+                  "per-skill scoping renders only the named skill to wb")
+            # idempotent re-run: same everything -> reported no-op, no writes
+            hub_txt_before = open(p("hub.toml")).read()
+            ra2 = Report("agent-add-again")
+            _dispatch(_parse(["agent-add", "wb", "--target", wb_t, "--yes"]), ra2)
+            check(ra2.exit_code == 0
+                  and open(p("hub.toml")).read() == hub_txt_before
+                  and any("nothing to do" in a for a in ra2.actions),
+                  "agent-add is an idempotent no-op when fully converged")
+            # re-registering with a DIFFERENT target is refused, not ignored
+            ra2b = Report("agent-add-retarget")
+            _dispatch(_parse(["agent-add", "wb", "--target",
+                              os.path.join(td, "elsewhere"), "--yes"]), ra2b)
+            check(ra2b.exit_code == 2
+                  and any("already registered with target" in w
+                          for w in ra2b.warnings),
+                  "a changed --target is refused with both paths named")
+            # convergence: knock wb out of the device file, re-run repairs it
+            txt_nowb = open(dev_fp).read().replace(', "wb"', '')
+            open(dev_fp, "w").write(txt_nowb)
+            ra2c = Report("agent-add-repair")
+            _dispatch(_parse(["agent-add", "wb", "--target", wb_t, "--yes"]), ra2c)
+            check(ra2c.exit_code == 0
+                  and "wb" in tomllib.loads(open(dev_fp).read())["agents"]
+                  and any("converging" in a for a in ra2c.actions),
+                  "re-running on a registered agent repairs device membership")
+            # a commented-out [agents.parked] decoy must not block the append
+            with open(p("hub.toml"), "a") as fh:
+                fh.write('\n# [agents.parked]\n# target = "~/nope"\n')
+            ra3 = Report("agent-add-parked")
+            _dispatch(_parse(["agent-add", "parked", "--target",
+                              os.path.join(td, "t-parked"), "--yes"]), ra3)
+            check(ra3.exit_code == 0 and "parked" in load_manifest()["agents"],
+                  f"commented decoy block does not break agent-add "
+                  f"(warnings: {ra3.warnings})")
+            # refusals: bad name, symlink/plain-file/hub-internal/duplicate
+            # target, non-tty without --yes
+            ra4 = Report("agent-add-badname")
+            _dispatch(_parse(["agent-add", "!!!", "--target", wb_t, "--yes"]), ra4)
+            check(ra4.exit_code == 2, "invalid name refused")
+            wb_link = os.path.join(td, "t-wb-link")
+            os.symlink(wb_t, wb_link)
+            ra5 = Report("agent-add-link")
+            _dispatch(_parse(["agent-add", "nolink", "--target", wb_link,
+                              "--yes"]), ra5)
+            check(ra5.exit_code == 2 and "nolink" not in load_manifest().get(
+                "agents", {}), "symlink target refused")
+            file_t = os.path.join(td, "t-file")
+            open(file_t, "w").write("not a dir\n")
+            ra5b = Report("agent-add-file")
+            _dispatch(_parse(["agent-add", "afile", "--target", file_t,
+                              "--yes"]), ra5b)
+            check(ra5b.exit_code == 2 and "afile" not in load_manifest().get(
+                "agents", {}), "plain-file target refused before any write")
+            ra5c = Report("agent-add-internal")
+            _dispatch(_parse(["agent-add", "inner", "--target", p("skills"),
+                              "--yes"]), ra5c)
+            check(ra5c.exit_code == 2, "hub-internal target refused")
+            ra5d = Report("agent-add-dupe")
+            _dispatch(_parse(["agent-add", "dupe", "--target", wb_t,
+                              "--yes"]), ra5d)
+            check(ra5d.exit_code == 2 and "dupe" not in load_manifest().get(
+                "agents", {}), "a second agent on the same dir refused")
+            real_stdin = sys.stdin
+            sys.stdin = io.StringIO("")          # not a tty
+            try:
+                hub_txt_pre = open(p("hub.toml")).read()
+                ra6 = Report("agent-add-notty")
+                _dispatch(_parse(["agent-add", "shy", "--target",
+                                  os.path.join(td, "t-shy")]), ra6)
+            finally:
+                sys.stdin = real_stdin
+            check(ra6.exit_code == 2
+                  and open(p("hub.toml")).read() == hub_txt_pre
+                  and not os.path.exists(os.path.join(td, "t-shy")),
+                  "non-tty without --yes writes nothing and exits 2")
+            # tty gate: 'y' applies; EOF (Ctrl+D) is a clean decline
+            class _FakeTTY(io.StringIO):
+                def isatty(self):
+                    return True
+            sys.stdin = _FakeTTY("y\n")
+            try:
+                ra6c = Report("agent-add-tty")
+                _dispatch(_parse(["agent-add", "chatty", "--target",
+                                  os.path.join(td, "t-chatty")]), ra6c)
+            finally:
+                sys.stdin = real_stdin
+            check(ra6c.exit_code == 0
+                  and "chatty" in load_manifest()["agents"],
+                  "tty prompt + 'y' applies the edits")
+            sys.stdin = _FakeTTY("")             # tty but EOF
+            try:
+                ra6d = Report("agent-add-eof")
+                _dispatch(_parse(["agent-add", "eof", "--target",
+                                  os.path.join(td, "t-eof")]), ra6d)
+            finally:
+                sys.stdin = real_stdin
+            check(ra6d.exit_code == 2
+                  and "eof" not in load_manifest().get("agents", {})
+                  and not os.path.exists(os.path.join(td, "t-eof")),
+                  "EOF at the prompt is a clean decline, not a traceback")
+            # TOML injection: quotes/backslashes round-trip byte-identically
+            qtarget = os.path.join(td, 'has"quote\\back')
+            ra6e = Report("agent-add-escape")
+            _dispatch(_parse(["agent-add", "quote", "--target", qtarget,
+                              "--yes"]), ra6e)
+            check(ra6e.exit_code == 0
+                  and load_manifest()["agents"]["quote"]["target"] == qtarget
+                  and os.path.isdir(qtarget),
+                  "special chars in --target are escaped and parse back "
+                  "byte-identical")
+            # --all-devices + --protect + copy mode
+            dev2 = p("devices", "laptop.toml")
+            open(dev2, "w").write('profiles = ["base"]\n'
+                                  'agents   = ["claude"]\n'
+                                  'extra    = []\ndisable  = []\n')
+            ra7 = Report("agent-add-multi")
+            _dispatch(_parse(["agent-add", "multi", "--target",
+                              os.path.join(td, "t-multi"), "--mode", "copy",
+                              "--protect", ".trash,cache",
+                              "--all-devices", "--yes"]), ra7)
+            m_multi = load_manifest()
+            check(ra7.exit_code == 0
+                  and m_multi["agents"]["multi"]["mode"] == "copy"
+                  and m_multi["agents"]["multi"]["protect"]
+                  == [".trash", "cache"]
+                  and "multi" in tomllib.loads(open(dev2).read())["agents"]
+                  and "multi" in tomllib.loads(open(dev_fp).read())["agents"],
+                  "--all-devices + --mode copy + --protect all land")
+            # a device file without a top-level agents array: warn + exit 1,
+            # and NEVER land in an [[external]] block's own agents array
+            dev3 = p("devices", "noagents.toml")
+            open(dev3, "w").write('profiles = ["base"]\nextra    = []\n')
+            ra7b = Report("agent-add-noagents")
+            _dispatch(_parse(["agent-add", "orphan", "--target",
+                              os.path.join(td, "t-orphan"),
+                              "--device", "noagents", "--yes"]), ra7b)
+            check("orphan" in load_manifest()["agents"]
+                  and ra7b.exit_code == 1
+                  and any("no top-level agents array" in w
+                          for w in ra7b.warnings),
+                  f"missing agents array: registered but flagged "
+                  f"(exit {ra7b.exit_code})")
+            dev4 = p("devices", "extonly.toml")
+            open(dev4, "w").write('profiles = ["base"]\n\n[[external]]\n'
+                                  'name = "x"\npath = "/tmp/x"\n'
+                                  'agents = ["claude"]\n')
+            ra7c = Report("agent-add-extonly")
+            _dispatch(_parse(["agent-add", "orphan2", "--target",
+                              os.path.join(td, "t-orphan2"),
+                              "--device", "extonly", "--yes"]), ra7c)
+            conf4 = tomllib.loads(open(dev4).read())
+            check(conf4["external"][0]["agents"] == ["claude"]
+                  and "agents" not in conf4
+                  and ra7c.exit_code == 1,
+                  "an [[external]] array never receives a top-level name")
+            # pin the end state so later edits notice leaked sandbox agents
+            check(set(load_manifest()["agents"]) == {
+                "claude", "agents-std", "wb", "parked", "chatty", "quote",
+                "multi", "orphan", "orphan2"},
+                f"agent-add tests leave a pinned agent set "
+                f"(got {sorted(load_manifest()['agents'])})")
             # upstream evolves + local patch -> clean 3-way merge
             open(p("skills", "demo", "SKILL.md"), "a").write("local-patch\n")
             up_fp = os.path.join(upstream, "skills", "demo", "SKILL.md")
@@ -2231,12 +2810,146 @@ def cmd_selftest(args, rep):
             r7 = Report("continue")
             _dispatch(_parse(["update", "demo", "--continue"]), r7)
             check(r7.exit_code == 0, "update --continue finalizes")
-            # doctor should be green-ish (ignore orphan-profile info)
-            r8 = Report("doctor")
-            _dispatch(_parse(["doctor"]), r8)
-            hard = [i for i in r8.data.get("issues", [])
-                    if i["check"] in (1, 2, 4, 5, 13)]
-            check(not hard, f"doctor no hard issues (got {hard})")
+            # ---- agent-add --default: joins default_agents, loudly ----
+            hub_txt_pre = open(p("hub.toml")).read()
+            dev_txt_pre = open(dev_fp).read()
+            ra7 = Report("agent-add-default")
+            _dispatch(_parse(["agent-add", "loud", "--target",
+                              os.path.join(td, "t-loud"), "--yes",
+                              "--default"]), ra7)
+            m_loud = load_manifest()
+            check(ra7.exit_code == 0
+                  and "loud" in m_loud["hub"]["default_agents"]
+                  and "loud" in m_loud["agents"]
+                  and any("default_agents" in w for w in ra7.warnings),
+                  f"--default edits [hub] default_agents with a loud warning "
+                  f"(warnings: {ra7.warnings})")
+            open(p("hub.toml"), "w").write(hub_txt_pre)     # keep the sandbox
+            open(dev_fp, "w").write(dev_txt_pre)            # opt-in from here on
+            shutil.rmtree(os.path.join(td, "t-loud"))
+            # ---- doctor check 14: unmanaged known agent dirs (report-only) ----
+            # pure detection matrix against a temp home (no env swap needed)
+            hh = os.path.join(td, "home2")
+            wbdir = os.path.join(hh, ".workbuddy", "skills")
+            os.makedirs(os.path.join(wbdir, "demo"))
+            open(os.path.join(wbdir, "demo", "SKILL.md"), "w").write("x\n")
+            cands = [("workbuddy", "~/.workbuddy/skills")]
+            hits = _unmanaged_agent_dirs({"agents": {}}, hh, cands)
+            check(hits == [("workbuddy", "~/.workbuddy/skills")],
+                  f"check 14 flags a skill-bearing unmanaged dir (got {hits})")
+            man_reg = {"agents": {"workbuddy": {"target": wbdir}}}
+            check(_unmanaged_agent_dirs(man_reg, hh, cands) == [],
+                  "check 14 quiet when the dir is a registered target")
+            empty_home = os.path.join(td, "home-empty")
+            os.makedirs(os.path.join(empty_home, ".workbuddy", "skills"))
+            os.makedirs(os.path.join(empty_home, ".cursor", "skills",
+                                     "not-a-skill"))
+            check(_unmanaged_agent_dirs(
+                {"agents": {}}, empty_home,
+                [("workbuddy", "~/.workbuddy/skills"),
+                 ("cursor", "~/.cursor/skills"),
+                 ("windsurf", "~/.windsurf/skills")]) == [],
+                "empty dirs and SKILL.md-less entries never fire (false-positive"
+                " guard)")
+            man_ign = {"agents": {},
+                       "hub": {"doctor_known_dirs_ignore": ["~/.workbuddy/skills"]}}
+            check(_unmanaged_agent_dirs(man_ign, hh, cands) == [],
+                  "doctor_known_dirs_ignore silences a dir")
+            os.symlink(os.path.join(hh, ".workbuddy"),
+                       os.path.join(hh, ".alias"))
+            hits2 = _unmanaged_agent_dirs(
+                {"agents": {}}, hh,
+                [("workbuddy", "~/.workbuddy/skills"),
+                 ("alias", "~/.alias/skills")])
+            check(hits2 == [("workbuddy", "~/.workbuddy/skills")],
+                  f"two paths resolving to one dir fire once (got {hits2})")
+            git_home = os.path.join(td, "home-git")
+            os.makedirs(os.path.join(git_home, ".workbuddy", "skills",
+                                     "demo"))
+            open(os.path.join(git_home, ".workbuddy", "skills", "demo",
+                              "SKILL.md"), "w").write("x\n")
+            os.makedirs(os.path.join(git_home, ".workbuddy", "skills", ".git"))
+            check(_unmanaged_agent_dirs({"agents": {}}, git_home, cands) == [],
+                  "a git-repo dir is check 9's territory, not check 14's")
+            # a symlinked skill counts; dot-entries don't; hub-internal never
+            skill_src = os.path.join(hh, "real-skill")
+            os.makedirs(skill_src)
+            open(os.path.join(skill_src, "SKILL.md"), "w").write("x\n")
+            sym_home = os.path.join(td, "home-sym")
+            os.makedirs(os.path.join(sym_home, ".cursor", "skills"))
+            os.symlink(skill_src, os.path.join(sym_home, ".cursor", "skills",
+                                               "linked"))
+            check(_unmanaged_agent_dirs({"agents": {}}, sym_home,
+                                        [("cursor", "~/.cursor/skills")])
+                  == [("cursor", "~/.cursor/skills")],
+                  "a symlinked skill counts as plausible")
+            dot_home = os.path.join(td, "home-dot")
+            os.makedirs(os.path.join(dot_home, ".cursor", "skills", ".dot"))
+            open(os.path.join(dot_home, ".cursor", "skills", ".dot",
+                              "SKILL.md"), "w").write("x\n")
+            check(_unmanaged_agent_dirs({"agents": {}}, dot_home,
+                                        [("cursor", "~/.cursor/skills")]) == [],
+                  "dot-entries never count as skills")
+            check(_unmanaged_agent_dirs({"agents": {}}, "/",
+                                        [("self", p("skills"))]) == [],
+                  "a candidate inside the hub itself never fires")
+            man_ign_str = {"agents": {},
+                           "hub": {"doctor_known_dirs_ignore":
+                                   "~/.workbuddy/skills"}}
+            check(_unmanaged_agent_dirs(man_ign_str, hh, cands) == [],
+                  "a string-typed ignore value is coerced, not crashed on")
+            # end-to-end under a controlled HOME so real machine state can't leak in
+            fake_home = os.path.join(td, "home3")
+            os.makedirs(fake_home)
+            real_home = os.environ.get("HOME")
+            os.environ["HOME"] = fake_home
+            try:
+                # doctor should be green-ish (ignore orphan-profile info)
+                r8 = Report("doctor")
+                _dispatch(_parse(["doctor"]), r8)
+                hard = [i for i in r8.data.get("issues", [])
+                        if i["check"] in (1, 2, 4, 5, 13)]
+                check(not hard, f"doctor no hard issues (got {hard})")
+                check(not any(i["check"] == 14 for i in r8.data["issues"]),
+                      "check 14 quiet under a bare HOME")
+                wb3 = os.path.join(fake_home, ".workbuddy", "skills")
+                os.makedirs(os.path.join(wb3, "demo"))
+                open(os.path.join(wb3, "demo", "SKILL.md"), "w").write("x\n")
+                r8b = Report("doctor-14")
+                _dispatch(_parse(["doctor"]), r8b)
+                c14 = [i for i in r8b.data.get("issues", [])
+                       if i["check"] == 14]
+                hard14 = [i for i in r8b.data.get("issues", [])
+                          if i["check"] in (1, 2, 4, 9, 13)
+                          and not i.get("fixed")]
+                check(len(c14) == 1 and not hard14,
+                      f"check 14 fires once under HOME with an unmanaged dir, "
+                      f"stays out of the hard set (got {c14}, hard {hard14})")
+                check(r8b.exit_code == 0 and r8b.ok
+                      and not r8b.needs_attention,
+                      "check 14 never turns doctor red (behavioral assertion)")
+                r8c = Report("doctor-14-attn")
+                _dispatch(_parse(["doctor", "--write-attention"]), r8c)
+                na_txt = open(p("NEEDS_ATTENTION.md")).read()
+                check("[14]" in na_txt and "doctor_known_dirs_ignore" in na_txt,
+                      "check 14 flows into NEEDS_ATTENTION naming its own "
+                      "escape hatch")
+                os.remove(p("NEEDS_ATTENTION.md"))
+            finally:
+                if real_home is None:
+                    del os.environ["HOME"]
+                else:
+                    os.environ["HOME"] = real_home
+            # census hints at an unmanaged scanned dir, named sensibly
+            cdir = os.path.join(td, "home-census", ".workbuddy", "skills")
+            os.makedirs(os.path.join(cdir, "demo"))
+            open(os.path.join(cdir, "demo", "SKILL.md"), "w").write("x\n")
+            rc = Report("census-hint")
+            _dispatch(_parse(["census", "--dirs", cdir]), rc)
+            check(any("unmanaged agent dir" in a and "agent-add workbuddy" in a
+                      for a in rc.actions),
+                  f"census hints at unmanaged dirs with a derived name "
+                  f"(actions: {rc.actions[-2:]})")
             # lock-merge driver: union of two divergent locks
             lo = {"schema": 1, "skills": {"a": {"updated_at": "2026-01-01"}}}
             lt = {"schema": 1, "skills": {"b": {"updated_at": "2026-01-02"}}}
@@ -2272,6 +2985,21 @@ def _parse(argv):
         lambda **kw: argparse.ArgumentParser(parents=[common], **kw)))
 
     sub.add_parser("init")
+    aa = sub.add_parser("agent-add")
+    aa.add_argument("name")
+    aa.add_argument("--target", required=True)
+    aa.add_argument("--mode", choices=["symlink", "copy"], default="symlink")
+    aa.add_argument("--default", action="store_true",
+                    help="also add to [hub] default_agents (every enabled "
+                         "skill renders there — usually NOT what you want)")
+    dg = aa.add_mutually_exclusive_group()
+    dg.add_argument("--device", help="device file to update "
+                                     "(default: this machine's)")
+    dg.add_argument("--all-devices", action="store_true")
+    aa.add_argument("--protect", default="",
+                    help="comma-separated entry names the target dir protects")
+    aa.add_argument("--yes", action="store_true",
+                    help="apply without the confirmation prompt")
     o = sub.add_parser("onboard")
     o.add_argument("--device")
     o.add_argument("--no-bin", action="store_true")
@@ -2322,6 +3050,7 @@ DISPATCH = {
     "adopt": cmd_adopt, "sync": cmd_sync, "install": cmd_install,
     "update": cmd_update, "doctor": cmd_doctor, "status": cmd_status,
     "diff": cmd_diff, "lock-merge": cmd_lock_merge, "selftest": cmd_selftest,
+    "agent-add": cmd_agent_add,
 }
 
 

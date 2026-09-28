@@ -39,6 +39,8 @@ description: >
 | adopt this directory | `hub adopt <path>` (origin auto-detected: git remote → vendor, else self) |
 | what did I change vs upstream | `hub diff X` |
 | new machine | three commands: `git clone <instance-repo> ~/skills-hub` → `hub onboard` → `hub sync` |
+| new agent app appeared / put skills into app X | follow the README playbook "Onboarding an agent hub doesn't know about": discover the app's real scan dirs from its own caches/config, canary-probe symlink vs copy, then `hub agent-add X --target DIR` (opt-in — NOT `default_agents`); scope per-skill with `[skills.X] agents = [...]` |
+| doctor flags an unmanaged agent dir (check 14) | decide with the user: `hub agent-add …` to register, or add the path to `[hub] doctor_known_dirs_ignore` to silence |
 | 处理 hub 待办 | work through `NEEDS_ATTENTION.md` item by item, delete the file when done |
 
 ## 2. Output contract
@@ -66,7 +68,9 @@ blindly). Exception: `hub lock-merge` is a git merge driver — no JSON, exit
 - Deleting any foreign entity (something hub does not manage).
 - Anything requiring force push / overwriting the remote.
 - Same-name-different-content adoption choices.
-- Editing `[agents.*]` structure in hub.toml, or the hub script itself.
+- Hand-editing `[agents.*]` structure in hub.toml (prefer `hub agent-add`, which
+  validates and has the confirmation gate built in), or editing the hub script
+  itself.
 - Touching Claude's own plugin cache.
 
 ## 5. Self-modification discipline
