@@ -1874,6 +1874,11 @@ def cmd_agent_add(args, rep):
             fh.write(new)
         os.replace(tmp, real_fp)
         rep.act(f"updated {os.path.relpath(fp, HUB_ROOT)}")
+    # deliberate, confirmed change — commit it like install/adopt do, or the
+    # next sync's drift commit sweeps it up under a meaningless message
+    if git_commit_paths([os.path.relpath(fp, HUB_ROOT) for fp, _, _ in edits],
+                        f"hub: agent-add {name}"):
+        rep.act("committed the registration")
     if args.default and default_done:
         rep.warn(f"'{name}' is now in default_agents — EVERY enabled skill "
                  f"will render to {args.target}. Prefer opt-in scoping: "
@@ -2602,6 +2607,9 @@ def cmd_selftest(args, rep):
                   "agent-add appends exactly one block, byte-for-byte")
             check("wb" in tomllib.loads(open(dev_fp).read())["agents"],
                   "agent-add adds the name to the device agents array")
+            st = git(["status", "--porcelain"]).stdout
+            check("hub.toml" not in st and "testbox.toml" not in st,
+                  "agent-add commits its edit, leaving no drift")
             # opt-in by default: nothing renders to wb until a skill says so
             _dispatch(_parse(["sync"]), Report("sync-wb0"))
             check(not os.path.lexists(os.path.join(wb_t, "mine")),
@@ -2904,6 +2912,16 @@ def cmd_selftest(args, rep):
             real_home = os.environ.get("HOME")
             os.environ["HOME"] = fake_home
             try:
+                # --target is stored verbatim (~ and all) yet expands at use
+                ra9 = Report("agent-add-tilde")
+                _dispatch(_parse(["agent-add", "tilde", "--target",
+                                  "~/.wb2/skills", "--yes"]), ra9)
+                check(ra9.exit_code == 0
+                      and load_manifest()["agents"]["tilde"]["target"]
+                      == "~/.wb2/skills"
+                      and os.path.isdir(os.path.join(fake_home, ".wb2",
+                                                     "skills")),
+                      "~-targets are stored verbatim and expand at use")
                 # doctor should be green-ish (ignore orphan-profile info)
                 r8 = Report("doctor")
                 _dispatch(_parse(["doctor"]), r8)

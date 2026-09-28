@@ -474,4 +474,6 @@ Environment: `SKILL_HUB_ROOT` (instance path), `SKILL_HUB_DEVICE_FILE` (default 
 ./scripts/hub selftest      # sandboxed: init → onboard → install → sync → cleanup rules → 3-way merge → conflict → continue → doctor → lock-merge
 ```
 
+selftest swaps `HUB_ROOT` and `DEVICE_FILE` into a temp sandbox and never touches the real instance. When you experiment manually, point **both** `SKILL_HUB_ROOT` and `SKILL_HUB_DEVICE_FILE` at a sandbox — setting only the root still lets `onboard` overwrite the real `~/.agents/device-id`.
+
 The whole tool is one file, standard library only. Contributions that keep it that way are welcome. MIT licensed.
