@@ -382,10 +382,13 @@ Same-name candidates are compared by content hash: identical copies collapse to 
 | 12 | device id file missing; last sync older than 3 days | report |
 | 13 | lockfile merge driver not registered in this clone | report |
 | 14 | a well-known agent skill dir exists on this machine and holds skills, but is not a render target | report only |
+| 15 | `skill-hub` itself not usable on this device — either not enabled in any profile/extra, or enabled but rendered into none of this device's agent dirs | report |
 
-Checks 1, 2, 4, 9, 13 are *hard*: if any remains unfixed, doctor exits 1 with `needs_attention`. `--fix` only acts on targets of agents enabled in **this device's** file; other targets are report-only. Checks 10 (same skill reachable via several paths) and 11 (stale plugin-cache audit) are reserved.
+Checks 1, 2, 4, 9, 13 are *hard*: if any remains unfixed, doctor exits 1 with `needs_attention`. The second tier of check 15 (enabled but rendered nowhere) is also hard — that combination means materialization should have placed the links and didn't, which is exactly how an instance rots silently. `--fix` only acts on targets of agents enabled in **this device's** file; other targets are report-only. Checks 10 (same skill reachable via several paths) and 11 (stale plugin-cache audit) are reserved.
 
 Check 14 works off a small curated `KNOWN_AGENT_DIRS` list in the script; entries are added only with a verified source (vendor docs or observed on-machine behavior, dated). A dir counts only when it holds at least one plausible skill (a non-dot entry whose resolution contains `SKILL.md`) — installers love leaving empty dirs behind. Git-repo dirs are skipped (check 9's territory), and `[hub] doctor_known_dirs_ignore = [...]` silences a path you deliberately keep unmanaged. hub never auto-registers a render target: the check is a suggestion, not an action.
+
+Check 15 exists because the manager skill is the one entity every device needs, yet nothing else guarantees it: profiles are per-device choices, so a machine can be onboarded with profiles that never mention `skill-hub` (exactly how the Mac mini sat for three weeks with the CLI working but no agent able to invoke the skill). The "not enabled" tier is deliberately warn-only — a human may have reasons — while "enabled but rendered nowhere" is hard, because sync should have placed it and something is genuinely broken.
 
 ## The agent contract
 

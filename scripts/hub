@@ -2115,6 +2115,31 @@ def cmd_doctor(args, rep):
     if r.returncode != 0:
         issue(13, "hub-lock merge driver NOT registered in this clone "
               "(run `hub onboard`)")
+    # 15 skill-hub itself must be usable on this device: the manager skill
+    # silently missing from every agent dir is how instances rot. Two tiers:
+    # not enabled at all -> fixable warn; enabled but rendered nowhere ->
+    # hard issue (materialize should have placed it; find out why not).
+    if dev is not None and "skill-hub" in names:
+        enabled_now = expand_enabled(manifest, dev)
+        if "skill-hub" not in enabled_now:
+            issue(15, "skill-hub is not enabled on this device (no profile "
+                  "or extra covers it) — add it to devices/"
+                  f"{_did}.toml extra (or a profile) and run `hub sync`")
+        else:
+            rendered = 0
+            for aname in dev.get("agents", []):
+                cfg = manifest.get("agents", {}).get(aname)
+                if cfg is None:
+                    continue
+                tgt = os.path.join(os.path.expanduser(cfg["target"]),
+                                   "skill-hub")
+                if os.path.exists(tgt) or os.path.islink(tgt):
+                    rendered += 1
+            if rendered == 0:
+                issue(15, "skill-hub enabled but present in none of this "
+                      "device's agent dirs — run `hub sync` (if it still "
+                      "renders nothing, check for a blocking foreign "
+                      "entity)")["tier"] = "hard"
     if args.fix:
         drift = [i for i in issues if i["check"] == 7]
         if drift:
@@ -2141,8 +2166,12 @@ def cmd_doctor(args, rep):
                         i["fixed"] = True
                 rep.act("fixed: committed drift")
     rep.data["issues"] = issues
+    # check 15 fires in two tiers: "enabled but rendered nowhere" is hard
+    # (something is broken), "not enabled" stays warn-level (a valid, if
+    # unusual, configuration the human may have chosen deliberately).
     hard = [i for i in issues
-            if i["check"] in (1, 2, 4, 9, 13) and not i.get("fixed")]
+            if (i["check"] in (1, 2, 4, 9, 13)
+                or i.get("tier") == "hard") and not i.get("fixed")]
     if hard:
         rep.attention(f"{len(hard)} hard issue(s): "
                       + "; ".join(i["msg"] for i in hard[:5])
@@ -2953,6 +2982,48 @@ def cmd_selftest(args, rep):
                       "check 14 flows into NEEDS_ATTENTION naming its own "
                       "escape hatch")
                 os.remove(p("NEEDS_ATTENTION.md"))
+                # ---- doctor check 15: skill-hub itself usable on-device ----
+                # sandbox: skills/ has demo+mine, base profile = ["skill-hub"]
+                # (from init) + demo (from install --profile base). skill-hub
+                # itself is NOT in the sandbox library, so check 15 is quiet;
+                # a dummy named skill-hub makes the two tiers observable.
+                os.makedirs(p("skills", "skill-hub"))
+                open(p("skills", "skill-hub", "SKILL.md"), "w").write(
+                    "---\nname: skill-hub\n---\nmanager\n")
+                _dispatch(_parse(["sync", "--no-push"]), Report("sync-15"))
+                r15 = Report("doctor-15-quiet")
+                _dispatch(_parse(["doctor"]), r15)
+                check(not any(i["check"] == 15 for i in r15.data["issues"]),
+                      "check 15 quiet when skill-hub enabled and rendered")
+                # enabled (base profile covers it) but links removed -> hard
+                for t in (claude_t, agents_t):
+                    lp = os.path.join(t, "skill-hub")
+                    if os.path.lexists(lp):
+                        os.remove(lp)
+                r15b = Report("doctor-15-hard")
+                _dispatch(_parse(["doctor"]), r15b)
+                c15b = [i for i in r15b.data["issues"] if i["check"] == 15]
+                check(len(c15b) == 1 and c15b[0].get("tier") == "hard"
+                      and r15b.needs_attention,
+                      f"enabled-but-unrendered skill-hub is a hard issue "
+                      f"(got {c15b})")
+                _dispatch(_parse(["sync", "--no-push"]), Report("re-sync-15"))
+                r15c = Report("doctor-15-green")
+                _dispatch(_parse(["doctor"]), r15c)
+                check(not any(i["check"] == 15 for i in r15c.data["issues"]),
+                      "check 15 clears after a sync re-renders the links")
+                # disabled entirely -> warn tier only, never red
+                dev_t = p("devices", "testbox.toml")
+                saved_dev = open(dev_t).read()
+                open(dev_t, "w").write(saved_dev.replace(
+                    'profiles = ["base"]', 'profiles = []'))
+                r15d = Report("doctor-15-disabled")
+                _dispatch(_parse(["doctor"]), r15d)
+                c15d = [i for i in r15d.data["issues"] if i["check"] == 15]
+                check(len(c15d) == 1 and not r15d.needs_attention,
+                      f"not-enabled skill-hub stays warn-level (got {c15d})")
+                open(dev_t, "w").write(saved_dev)
+                shutil.rmtree(p("skills", "skill-hub"))
             finally:
                 if real_home is None:
                     del os.environ["HOME"]
