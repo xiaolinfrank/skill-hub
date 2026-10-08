@@ -31,7 +31,7 @@ description: >
 
 | User intent | Action |
 |---|---|
-| install X / bring X in | `hub install <source> [--profile P]` — source is `git+URL#ref=..&subdir=..` or a local path; if unclear, search or ask one question |
+| install X / bring X in | `hub install <source> [--profile P]` — source is `git+URL#ref=..&subdir=..` or a local path; if unclear, search or ask one question. **One-shot local content** (no future upstream, esp. from /tmp): don't install — copy into `skills/<name>/` and register `origin = "self"` in hub.toml AND flip the lock entry's origin (sync never rewrites provenance); never let an ephemeral path into `source` |
 | update X / update everything | `hub update X` or `hub update --all` (names or `--all` required; `hub update --check` first to see what is stale); on conflicts follow §3, then `hub update X --continue` |
 | sync / I changed things on another machine | `hub sync`; exit 1 → read `NEEDS_ATTENTION.md` and handle |
 | X on device B too / only on this machine | edit `devices/<id>.toml` (`extra` / `disable`) or `hub.toml` profiles → `hub sync` |

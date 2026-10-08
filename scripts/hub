@@ -1237,6 +1237,16 @@ def cmd_install(args, rep):
         rep.fail(f"cannot parse source '{args.source}' "
                  f"(use git+URL#ref=..&subdir=.. or a local path)", 2)
         return
+    # ephemeral paths rot: macOS wipes /tmp on reboot, XDG runtime dirs die
+    # with the session. A vendor source recorded from one can never be
+    # fetched again — flag it so the human decides now, not at update time.
+    if src["type"] == "local":
+        rp = os.path.realpath(src["path"])
+        if (rp.startswith("/tmp/") or rp.startswith("/var/folders/")
+                or rp.startswith("/run/user/")):
+            rep.warn(f"source '{rp}' is ephemeral — it will disappear; "
+                     f"for one-shot local content consider copying into "
+                     f"skills/ and registering origin = \"self\" instead")
     lock = load_lock()
     with tempfile.TemporaryDirectory() as tmp:
         try:
